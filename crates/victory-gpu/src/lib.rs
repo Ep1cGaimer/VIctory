@@ -35,6 +35,8 @@ pub mod frame;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod compose;
+#[cfg(windows)]
 mod indirect;
 pub mod list;
 #[cfg(windows)]

@@ -94,7 +94,7 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// on top of every title slot but takes the title's in full.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
@@ -158,8 +158,14 @@ impl HostHeap {
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
+                    // A capped heap (NVIDIA: 1,000,000) keeps the full
+                    // dynamic range: the world's fresh tables need several
+                    // hundred thousand slots a second, and with 2^16 most
+                    // of its indirect and mesh draws were dropped for want
+                    // of slots. The title's slots past the cap read the
+                    // guard slot instead.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - DYNAMIC, DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
