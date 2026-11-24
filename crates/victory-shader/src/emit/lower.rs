@@ -6930,9 +6930,11 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area), and so does an index past the declared vertex
-    /// maximum, which the host leaves undefined (a hang on some GPUs).
+    /// Mesh: `exp prim` as the lane's primitive: vertex indices in bits
+    /// [8:0], [18:10] and [28:20], edge flags in bits 9, 19 and 29 (not part
+    /// of the index). Bit 31 culls it (all indices 0: no area), and so does
+    /// an index past the declared vertex maximum, which the host leaves
+    /// undefined (a hang on some GPUs).
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
@@ -6943,10 +6945,10 @@ impl<'a> Lower<'a> {
         let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
         let mut indices = Vec::new();
         for k in 0..3 {
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
+            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
-            if max_vertices < 0x400 {
+            if max_vertices < 0x200 {
                 let limit = self.s.m.i32(max_vertices);
                 let past = self.s.m.cmp(c, pred::IUGE, i, limit);
                 culled = self.s.m.bin(c, Bin::Or, culled, past);
