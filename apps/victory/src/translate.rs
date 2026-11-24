@@ -327,8 +327,41 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // `VICTORY_ONLY` (label substrings, comma-separated): only those.
+    if let Ok(only) = std::env::var("VICTORY_ONLY")
+        && !only.split(',').any(|o| example().contains(o))
+    {
+        return;
+    }
     for p in programs {
         t.programs += 1;
+        // `VICTORY_DISASM` (a label substring) with `VICTORY_EMIT_DUMP`:
+        // the matching programs' instructions as text files.
+        if let (Ok(want), Ok(dir)) = (
+            std::env::var("VICTORY_DISASM"),
+            std::env::var("VICTORY_EMIT_DUMP"),
+        ) && example().contains(&want)
+            && let Ok(insts) = victory_shader::gfx10::decode(&p.patched_code())
+        {
+            let text: String = insts
+                .iter()
+                .map(|i| {
+                    let t = match i.name() {
+                        Some(_) => i.text(p.wave64),
+                        None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
+                    };
+                    format!("{:06x}: {t}\n", i.offset)
+                })
+                .collect();
+            let name: String = format!("{} {:?}", example(), p.stage)
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            let _ = std::fs::write(
+                format!("{dir}/{}.s", &name[name.len().saturating_sub(100)..]),
+                format!("wave64 {}\n{text}", p.wave64),
+            );
+        }
         match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
             Ok(program) => {
                 t.translated += 1;
