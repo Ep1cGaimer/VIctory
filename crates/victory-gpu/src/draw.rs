@@ -175,6 +175,36 @@ fn not_run(why: &'static str) {
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
+/// The frame (presented count) of the last compute dispatch the host
+/// dropped, plus one (0: none yet).
+static COMPUTE_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// A compute dispatch did not run on the host: whatever it would have
+/// written (often the arguments of indirect draws) holds stale data.
+fn compute_dropped() {
+    COMPUTE_DROPPED.store(crate::queue::presented() + 1, Ordering::Relaxed);
+}
+
+/// Whether indirect draws run now: not in a frame, or the one after, in
+/// which a compute dispatch was dropped. The title's culling passes write
+/// those draws' arguments and the data their shaders read; with a pass
+/// dropped the arguments are stale or garbage, and the clamp bounds the
+/// vertices but not the pixels: in the world a single such draw of
+/// screen-filling triangles ran for 24 s until the host reset the device
+/// (`VICTORY_SKIP_INDIRECT=0,1` kept it alive). `VICTORY_INDIRECT_UNGATED=1`
+/// turns the gate off.
+///
+/// shortcut: any dropped dispatch closes the gate, not only the passes that
+/// write these arguments (dropped programs' writes are unknown).
+fn indirect_draws_open() -> bool {
+    static UNGATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *UNGATED.get_or_init(|| std::env::var("VICTORY_INDIRECT_UNGATED").is_ok_and(|v| v == "1")) {
+        return true;
+    }
+    let dropped = COMPUTE_DROPPED.load(Ordering::Relaxed);
+    dropped == 0 || crate::queue::presented() > dropped
+}
+
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
@@ -924,6 +954,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             dropped(list, self.pipeline, "dispatch");
+            compute_dropped();
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -932,6 +963,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            compute_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
@@ -942,6 +974,7 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            compute_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
@@ -1589,6 +1622,27 @@ impl State {
             why("no host pipeline");
             return false;
         }
+        // Diagnostics: VICTORY_SKIP_INDIRECT names the kinds (PC numbering,
+        // comma separated) whose indirect execution is dropped.
+        #[cfg(feature = "diagnostics")]
+        {
+            static SKIP: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+            let skip = SKIP.get_or_init(|| {
+                std::env::var("VICTORY_SKIP_INDIRECT")
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|k| k.trim().parse().ok())
+                    .collect()
+            });
+            if skip.contains(&kind) {
+                why("skipped (VICTORY_SKIP_INDIRECT)");
+                return false;
+            }
+        }
+        if matches!(kind, DRAW | INDEXED) && !indirect_draws_open() {
+            why("a compute pass was dropped this frame or the last");
+            return false;
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -1637,6 +1691,9 @@ impl State {
             _ => false,
         };
         if !ran {
+            if kind == DISPATCH {
+                compute_dropped();
+            }
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
