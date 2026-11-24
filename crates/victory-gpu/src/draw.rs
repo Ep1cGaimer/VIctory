@@ -73,7 +73,7 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -459,7 +459,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, &t.host.user_data, compute);
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -645,8 +645,18 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    pub(crate) fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        user_data: &[victory_shader::emit::UserData],
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
+        let fixed = |slot: u8| {
+            user_data.iter().find(|u| u.root == RootType::Table && u.slot == slot)
+                .and_then(|u| u.table_slots)
+        };
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
@@ -663,9 +673,12 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
                 continue;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
             let Some(heap) = self.heap_of(table) else {
                 continue;
+            };
+            let end = match fixed(u.slot) {
+                Some((_, hi)) if !heap.samplers() => table + u64::from(hi) * 32,
+                _ => table + u64::from(u.table_offset_dwords) * 4,
             };
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
@@ -697,30 +710,41 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
+            // Only fixed offsets prove a prefix or suffix unused. With an
+            // array index, preserve every slot in the original table span.
+            let (lo, hi) = fixed(slot).unwrap_or_else(|| {
+                (0, entries.iter().map(|u| u.table_offset_dwords / 8).max().unwrap_or(0))
+            });
+            if heap.samplers() || (table - heap.start) % 32 != 0
+                || heap.index(table + u64::from(hi) * 32).is_none()
+            {
+                self.table_failed = true;
+                continue;
+            }
+            let n = hi - lo + 1;
+            let start = table + u64::from(lo) * 32;
+            // Shader address arithmetic adds its original guest offset in
+            // 32 bits, including when the rebased pointer wraps below zero.
+            let base = |first: u32| first.wrapping_sub(lo).wrapping_mul(32);
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 for k in 0..n {
-                    let at = table + u64::from(k) * 32;
+                    let at = start + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
-                (table, h.finish())
+                (start, n, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
+                    if heap.index(handle).is_some() && let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u, &view);
                     }
                 }
-                made.push((slot, first * 32));
+                made.push((slot, base(first)));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
@@ -739,8 +763,8 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == lo + k);
+                match crate::descriptor::view(start + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
@@ -763,7 +787,7 @@ impl State {
                     }
                 }
             }
-            made.push((slot, first * 32));
+            made.push((slot, base(first)));
         }
         made
     }

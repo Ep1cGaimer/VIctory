@@ -1156,6 +1156,7 @@ impl<'a> Lower<'a> {
                 slot: rp.slot,
                 root: rp.root,
                 dword,
+                table_slots: None,
             },
         );
         self.s.user_data = self.s.user_data.max(index + 1);

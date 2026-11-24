@@ -576,7 +576,7 @@ fn buffer_uav(
 /// family takes the texture's format.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
-fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+fn fits(resource: crate::object::This, texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -608,6 +608,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
         return !typeless;
+    }
+    // A packed 16-bit target made R8G8B8A8_UNORM on this GPU
+    // (`resource::target_format`): views name the format it has.
+    if crate::resource::widened_from(resource, own) == Some(view) {
+        if let Some(format) = format {
+            *format = d.Format;
+        }
+        return true;
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
@@ -649,7 +657,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
                 let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                if !fits(resource, texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
@@ -680,7 +688,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 };
             };
             let mut desc = desc.as_ref().map(uav_desc);
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            if !fits(resource, texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.

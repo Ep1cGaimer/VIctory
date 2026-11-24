@@ -231,7 +231,9 @@ impl RtvRecord {
                 0,
             ]
         };
-        words[0] = crate::resource::pc_format(words[0]);
+        // Render target and depth views: a packed 16-bit target may be
+        // R8G8B8A8_UNORM on this GPU (`resource::target_format`).
+        words[0] = crate::resource::target_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }
@@ -739,6 +741,47 @@ mod tests {
         assert_eq!(view(s3), view(s1));
         assert_eq!(view(at(0) + 8), None);
         heap[0] = 0;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fixed_table_slots_use_compact_dynamic_ranges() {
+        use victory_shader::{ResourceType, RootType, UsedResource, emit::UserData};
+        let Some(host) = crate::host::host() else {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let mut h = std::ptr::null();
+        let desc = HeapDesc { kind: VIEWS_KIND, count: 1024, flags: SHADER_VISIBLE, nodes: 0 };
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
+        let mut state = crate::draw::State::default();
+        state.set_heaps(&[h]);
+        let table = heap(h).start;
+        state.set_table(false, 0, table);
+        let used = [UsedResource {
+            root: RootType::Table, kind: ResourceType::Cbv, slot: 0, user_data: 0,
+            table_offset_dwords: 511 * 8, lower_bound: 0, stride: 8, dwords: 4,
+        }];
+        let mut binding = [UserData {
+            index: 0, slot: 0, root: RootType::Table, dword: 0, table_slots: Some((511, 511)),
+        }];
+        let cb = [0u32; 64];
+        let address = cb.as_ptr() as u64;
+        create_cbv(std::ptr::null(), &[address as u32, (address >> 32) as u32, 256, 0],
+            table + 511 * 32);
+        let first = state.tables(&list, &used, &binding, false);
+        assert_eq!(first, [(0, (1024 - 511) * 32)]);
+        assert_eq!(state.tables(&list, &used, &binding, false), first);
+        // The fixed access consumed one slot; the indexed array still
+        // gets 512 consecutive slots after it and its original offsets.
+        binding[0].table_slots = None;
+        assert_eq!(state.tables(&list, &used, &binding, false), [(0, 1025 * 32)]);
+        state.set_table(false, 0, table + 32);
+        binding[0].table_slots = Some((511, 511));
+        assert_eq!(state.tables(&list, &used, &binding, false), [(0, (1537 - 511) * 32)]);
+        drop(state);
+        object::release_boxed::<Heap>(h);
     }
 
     /// A released resource's views go stale; the same view of a new

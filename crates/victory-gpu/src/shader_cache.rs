@@ -180,6 +180,9 @@ fn encode(s: &HostShader) -> Vec<u8> {
         for v in [u.index, u32::from(u.slot), root_code(u.root), u.dword] {
             word(&mut out, v);
         }
+        let (lo, hi) = u.table_slots.unwrap_or((u32::MAX, 0));
+        word(&mut out, lo);
+        word(&mut out, hi);
     }
     word(&mut out, s.samplers.len() as u32);
     for sampler in &s.samplers {
@@ -243,6 +246,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             slot: u8::try_from(r.word()?).ok()?,
             root: root_type(r.word()?),
             dword: r.word()?,
+            table_slots: match (r.word()?, r.word()?) {
+                (u32::MAX, 0) => None,
+                (lo, hi) if lo <= hi && hi <= u32::MAX / 32 => Some((lo, hi)),
+                _ => return None,
+            },
         });
     }
     let n = r.word()? as usize;
@@ -290,6 +298,7 @@ mod tests {
                 slot: 1,
                 root: RootType::Table,
                 dword: 0,
+                table_slots: Some((32, 39)),
             }],
             samplers: vec![[0x400, 0xc0_0000, 0x18f0_0000, 0]],
             static_samplers: vec![StaticSampler::from_words([
