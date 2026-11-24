@@ -132,13 +132,19 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// The start of a present plane: frame token, the plane's resources, and
+/// the part of the first shown (left, top, right, bottom texels; may be
+/// null). Measured on the title's Series S frames: two planes, 0x48 bytes
+/// apart.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    source: *const [i32; 4],
 }
+/// Bytes from one plane description to the next.
+const PLANE_STRIDE: usize = 0x48;
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -232,10 +238,8 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Shows the planes' first resources in our window, composited when there
+/// are several ([`crate::compose`]).
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -276,25 +280,55 @@ extern "system" fn present(
         crate::capture::dump_targets(frame);
     }
     #[cfg(windows)]
-    if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
-        && let Some(host) = crate::host::host()
-    {
+    if let Some(host) = crate::host::host() {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
+        // Each plane's first resource with its host texture and the part
+        // of it shown; the host states are left as they were.
+        let mut shown: Vec<(This, crate::compose::Shown<'_>)> = Vec::new();
+        for k in 0..(planes as usize).min(crate::compose::PLANES) {
+            // SAFETY: the title passes `planes` descriptions, PLANE_STRIDE
+            // bytes apart.
+            let Some(plane) = (unsafe { plane_parameters.cast::<u8>().add(k * PLANE_STRIDE).cast::<Plane>().as_ref() }) else {
+                break;
+            };
+            if plane.count == 0 || plane.resources.is_null() {
+                continue;
+            }
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources };
+            let Some(texture) = crate::resource::host_resource(resource) else { continue };
+            // SAFETY: a live resource.
+            let desc = unsafe { texture.GetDesc() };
+            // SAFETY: null or the plane's source rectangle.
+            let rect = unsafe { plane.source.as_ref() }.and_then(|r| {
+                let fits = 0 <= r[0] && r[0] < r[2] && r[2] as u64 <= desc.Width
+                    && 0 <= r[1] && r[1] < r[3] && r[3] as u32 <= desc.Height;
+                fits.then(|| r.map(|v| v as u32))
+            });
+            let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                .map_or(COPY_SOURCE, |(_, before)| before);
+            shown.push((resource, crate::compose::Shown { texture, state, rect }));
+        }
         #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        if shown.len() > 1 {
+            static SEEN: AtomicBool = AtomicBool::new(false);
+            if !SEEN.swap(true, Ordering::Relaxed) {
+                // SAFETY: live resources.
+                let sizes: Vec<_> = shown.iter().map(|(_, s)| { let d = unsafe { s.texture.GetDesc() }; (d.Width, d.Height, d.Format.0, s.rect) }).collect();
+                tracing::info!(planes, ?sizes, "present planes (width, height, format, source rectangle)");
+            }
+        }
+        if !shown.is_empty() {
+            let (resources, planes): (Vec<_>, Vec<_>) = shown.into_iter().unzip();
+            let result = host.present(&planes, frame);
+            for (resource, plane) in resources.iter().zip(&planes) {
+                crate::resource::host_transition(*resource, plane.state);
+            }
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, resources[0], planes[0].state, result);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = result;
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);

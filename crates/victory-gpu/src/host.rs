@@ -1544,6 +1544,8 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// Draws several present planes into one picture, once one is needed.
+    compositor: Option<crate::compose::Compositor>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -1667,17 +1669,26 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
-        // SAFETY: a live resource.
-        let desc = unsafe { texture.GetDesc() };
-        let Some(format) = swap_format(desc.Format) else {
-            tracing::warn!(format = desc.Format.0, "cannot present this format");
+    /// Shows the planes, each in its host state (where it stays), plane 0
+    /// first, as frame `frame` (saved if captures are on): one plane
+    /// shown whole is copied, several are composited
+    /// ([`crate::compose`]). `None` if nothing was shown; else, in
+    /// diagnostics builds, whether the frame was black.
+    pub(crate) fn present(&self, planes: &[crate::compose::Shown<'_>], frame: u64) -> Option<bool> {
+        let first = planes.first()?;
+        // SAFETY: live resources.
+        let descs: Vec<_> = planes.iter().map(|p| unsafe { p.texture.GetDesc() }).collect();
+        let Some(format) = swap_format(descs[0].Format) else {
+            tracing::warn!(format = descs[0].Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let copied = planes.len() == 1
+            && first.rect.is_none_or(|r| r == [0, 0, descs[0].Width as u32, descs[0].Height]);
+        // The picture: the largest plane's size.
+        let (width, height) = descs
+            .iter()
+            .map(|d| (d.Width as u32, d.Height))
+            .max_by_key(|&(w, h)| u64::from(w) * u64::from(h))?;
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -1703,8 +1714,25 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
-        // SAFETY: our swap chain, list and a live source texture.
+        if !copied && p.compositor.as_ref().is_none_or(|c| c.format() != format) {
+            p.compositor = match crate::compose::Compositor::new(&self.device, format) {
+                Ok(c) => {
+                    tracing::info!(planes = planes.len(), width, height, "compositing present planes");
+                    Some(c)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no plane compositor: plane 0 shown alone");
+                    None
+                }
+            };
+        }
+        // Without a compositor, plane 0 is copied when it fits the picture.
+        let compositor = if copied { None } else { p.compositor.as_ref() };
+        if compositor.is_none() && (descs[0].Width as u32, descs[0].Height) != (width, height) {
+            return None;
+        }
+        const SHADER_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        // SAFETY: our swap chain, list and live plane textures.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
@@ -1712,31 +1740,45 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            // Each plane to the state it is read in, and back after.
+            let read = if compositor.is_some() { SHADER_READ } else { D3D12_RESOURCE_STATE_COPY_SOURCE };
+            let shown = if compositor.is_some() { planes } else { &planes[..1] };
+            let moves = |to_read: bool| -> Vec<D3D12_RESOURCE_BARRIER> {
+                shown
+                    .iter()
+                    .filter_map(|s| {
+                        let state = D3D12_RESOURCE_STATES(s.state as i32);
+                        (state.0 & read.0 != read.0).then(|| {
+                            if to_read { transition(s.texture, state, read) } else { transition(s.texture, read, state) }
+                        })
+                    })
+                    .collect()
+            };
+            let mut barriers = moves(true);
+            let target = if compositor.is_some() { D3D12_RESOURCE_STATE_RENDER_TARGET } else { D3D12_RESOURCE_STATE_COPY_DEST };
+            barriers.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, target));
+            list.ResourceBarrier(&barriers);
+            match compositor {
+                Some(c) => {
+                    c.record(&self.device, list, &back, (width, height), shown);
+                    list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                }
+                None => list.CopyResource(&back, first.texture),
+            }
+            // What was shown: the back buffer when composited, else plane 0.
+            let picture = if compositor.is_some() { &back } else { first.texture };
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::capture::read_back(&self.device, list, picture))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = crate::capture::probe(&self.device, list, texture);
+            let probe = crate::capture::probe(&self.device, list, picture);
             #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            let _ = (frame, picture);
+            let mut barriers = moves(false);
+            let shown_state = if compositor.is_some() { D3D12_RESOURCE_STATE_COPY_SOURCE } else { target };
+            barriers.push(transition(&back, shown_state, D3D12_RESOURCE_STATE_PRESENT));
+            list.ResourceBarrier(&barriers);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
@@ -1792,6 +1834,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                compositor: None,
             })
         }
     }
