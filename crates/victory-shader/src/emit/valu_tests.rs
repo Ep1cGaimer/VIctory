@@ -81,7 +81,13 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    lower_cs(&words).expect("lower")
+}
 
+/// Lowers the 1-thread compute program `words` with the layout of
+/// [`build_valu_cs`]: root constants in `s0..s3`, the address of a table
+/// of one raw UAV in `s4`.
+fn lower_cs(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -136,8 +142,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
-    .expect("lower");
+    })?;
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -156,7 +161,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         assert_eq!(copy[4..20], ours[..], "container hash mismatch");
     }
 
-    shader
+    Ok(shader)
 }
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
@@ -932,4 +937,112 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+/// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], offset` plus SGPR
+/// `soffset` (125: none).
+const fn s_load_dwordx4_at(dst: u8, base: u8, offset: u32, soffset: u8) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        (soffset as u32) << 25 | (offset & 0x1F_FFFF),
+    ]
+}
+
+/// MUBUF `buffer_load_format_x vdata, off, s[srsrc:srsrc+3], 0`.
+const fn buffer_load_format_x(vdata: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
+/// The reason a program that does not lower stops with.
+fn refusal(words: &[u32]) -> &'static str {
+    match lower_cs(words) {
+        Err(crate::ShaderError::Unsupported { what, .. }) => what,
+        Err(e) => panic!("unexpected error {e}"),
+        Ok(_) => panic!("lowered"),
+    }
+}
+
+/// `v_mov_b32 v0, s14` after a second load of the table's descriptor into
+/// `s[12:15]` at byte `offset`: the buffer's size in bytes (dword 2).
+fn size_through_second_load(offset: u32) -> Vec<u32> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&s_load_dwordx4_at(12, 4, offset, 125));
+    body.push(vop1(0x001, 0, sgpr(14)));
+    body
+}
+
+#[test]
+fn a_buffer_size_read_through_another_load_of_its_descriptor() {
+    // The store's descriptor load gives the view's kind (a raw UAV); the
+    // load whose dword 2 is read is only data.
+    let shader = build_valu_cs(&size_through_second_load(0));
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 4, "{backend}: a raw view of one dword");
+    });
+}
+
+#[test]
+fn a_descriptor_no_view_uses_stays_data() {
+    // The next descriptor of the table: no load of it is a view operand.
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(&size_through_second_load(16));
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    assert_eq!(refusal(&words), "a descriptor read only as data");
+}
+
+#[test]
+fn a_descriptor_its_loads_use_as_two_views_stays_data() {
+    // A raw store through one load, a typed load through another.
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(&s_load_dwordx4(16, 4));
+    words.extend_from_slice(&buffer_load_format_x(1, 16));
+    words.extend_from_slice(&size_through_second_load(0));
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    assert_eq!(
+        refusal(&words),
+        "a descriptor read as data that its loads use as different views"
+    );
+}
+
+/// Loads the table's descriptor at the first lane's copy of `v5` (0) for
+/// the store, and again at the first lane's copy of `v[index]` for its size.
+fn size_at_first_lane(index: u8) -> Vec<u32> {
+    let mut words = vec![
+        s_mov_b32(5, 0x80),
+        vop1(0x001, 5, 128),     // v_mov_b32 v5, 0
+        vop1(0x001, 6, 128),     // v_mov_b32 v6, 0
+        vop1(0x002, 6, vgpr(5)), // v_readfirstlane_b32 s6, v5
+    ];
+    words.extend_from_slice(&s_load_dwordx4_at(8, 4, 0, 6));
+    words.push(vop1(0x002, 7, vgpr(index))); // v_readfirstlane_b32 s7, v[index]
+    words.extend_from_slice(&s_load_dwordx4_at(12, 4, 0, 7));
+    words.push(vop1(0x001, 0, sgpr(14)));
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    words
+}
+
+#[test]
+fn a_size_read_at_the_first_lane_of_the_same_index() {
+    let shader = lower_cs(&size_at_first_lane(5)).expect("lower");
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 4, "{backend}: a raw view of one dword");
+    });
+}
+
+#[test]
+fn a_size_read_at_the_first_lane_of_another_index_stays_data() {
+    // v6 holds the same number as v5 but is another value: nothing says the
+    // two indices meet the same descriptor.
+    assert_eq!(
+        refusal(&size_at_first_lane(6)),
+        "a descriptor read only as data"
+    );
 }
