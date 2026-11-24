@@ -62,6 +62,15 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Held by tests that dispatch on the host GPU, one at a time: with tests on
+/// the hardware adapter and WARP from several test threads at once, now and
+/// then none of their dispatches ever completes and the test binary hangs.
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl Host {
     /// Whether the device runs 64-bit atomics on typed resources reached
     /// through the descriptor heap (what translated 64-bit image atomics

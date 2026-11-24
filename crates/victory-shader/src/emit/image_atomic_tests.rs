@@ -151,8 +151,7 @@ fn build(body: &[u32]) -> HostShader {
 /// host with 64-bit atomics on heap typed resources; `check` gets the
 /// first three texels of row 0 of a zeroed 4x1 R32G32_UINT texture.
 fn run(shader: &HostShader, cases: &[[u32; 4]], mut check: impl FnMut(&str, [u32; 4], [u64; 3])) {
-    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = super::host::gpu_test_lock();
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
