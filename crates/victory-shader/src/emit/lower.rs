@@ -2833,6 +2833,30 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Mesh: `guard` and the lane's vertex (with `per_primitive`, its
+    /// primitive) index under the declared maximum. The console drops
+    /// exports past the counts the program asked for; on the host, writes
+    /// past the declared maxima are undefined.
+    fn mesh_bound(&mut self, per_primitive: bool, guard: Option<V>) -> Option<V> {
+        let mesh = self.s.mesh.expect("mesh");
+        let max = if per_primitive {
+            mesh.max_primitives
+        } else {
+            mesh.max_vertices
+        };
+        if self.s.threads.expect("mesh")[0] <= max {
+            return guard;
+        }
+        let flat = self.mesh_thread();
+        let c = self.cur;
+        let limit = self.s.m.i32(max);
+        let inside = self.s.m.cmp(c, pred::IULT, flat, limit);
+        Some(match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, g, inside),
+            None => inside,
+        })
+    }
+
     /// Mesh: the thread's index in the group, which is its vertex and
     /// primitive index.
     fn mesh_thread(&mut self) -> V {
@@ -9156,6 +9180,15 @@ impl<'a> Lower<'a> {
             self.s
                 .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
         }
+        let guard = if mesh {
+            let per_primitive = matches!(
+                e.target,
+                Target::Primitive | Target::PrimitiveParam { .. }
+            );
+            self.mesh_bound(per_primitive, guard)
+        } else {
+            guard
+        };
         if mesh && e.target == Target::Primitive {
             return self.emit_indices(e, guard);
         }
@@ -9347,19 +9380,30 @@ impl<'a> Lower<'a> {
     /// bits: a 9-bit vertex index and, above it, its edge flag (bits 9, 19
     /// and 29), which only the console's edge-flag rasterisation reads and
     /// which is no part of the index. Bit 31 culls it (all indices 0: no
-    /// area).
+    /// area), and so does an index past the declared vertex maximum, which
+    /// the host leaves undefined (a hang on some GPUs).
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        let max_vertices = self.s.mesh.expect("mesh").max_vertices;
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let mut indices = Vec::new();
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            if max_vertices < 0x400 {
+                let limit = self.s.m.i32(max_vertices);
+                let past = self.s.m.cmp(c, pred::IUGE, i, limit);
+                culled = self.s.m.bin(c, Bin::Or, culled, past);
+            }
+            indices.push(i);
+        }
+        let mut args = vec![self.mesh_thread()];
+        for i in indices {
             args.push(self.s.m.select(c, culled, z, i));
         }
         let void = self.s.t.void;
