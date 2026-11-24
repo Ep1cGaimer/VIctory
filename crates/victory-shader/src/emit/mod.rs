@@ -348,6 +348,42 @@ pub struct UserData {
     /// [`ROOT_SRV_VIEW`], [`ROOT_UAV_VIEW`] or [`ROOT_VIEW_OFFSET`] name
     /// its view's heap index or its offset in that view instead.
     pub dword: u32,
+    /// Inclusive 32-byte view slots addressed relative to this table when
+    /// every descriptor load from it has a fixed offset.
+    pub table_slots: Option<(u32, u32)>,
+}
+
+/// Each alternative of a selected descriptor counts. One computed offset
+/// makes the whole root ineligible for narrowing, even when another load
+/// from that root has a fixed offset.
+fn table_slots(
+    layout: &[crate::RootParam],
+    res: &resource::Resources,
+) -> std::collections::HashMap<u8, Option<(u32, u32)>> {
+    use resource::{Role, Source};
+    let addresses: std::collections::HashMap<_, _> = res.scalar.iter().copied().collect();
+    let mut spans = std::collections::HashMap::new();
+    for descriptor in &res.descriptors {
+        for source in descriptor.source.leaves() {
+            let (Source::Loaded { load, first } | Source::Fetched { load, first }) = source else {
+                continue;
+            };
+            // Every load used to emit a heap handle has a tracked address.
+            let Some(address) = addresses.get(load) else { return Default::default() };
+            let Some(root) = layout.get(address.param) else { continue };
+            if root.root != RootType::Table {
+                continue;
+            }
+            let slot = (descriptor.role == Role::Resource && address.dynamic.is_none())
+                .then_some(address.offset.wrapping_add(4 * u32::from(*first)) / 32);
+            spans.entry(root.slot)
+                .and_modify(|span: &mut Option<(u32, u32)>| {
+                    *span = span.zip(slot).map(|((lo, hi), s)| (lo.min(s), hi.max(s)));
+                })
+                .or_insert(slot.map(|s| (s, s)));
+        }
+    }
+    spans
 }
 
 /// How a translation is made.
@@ -482,17 +518,23 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let (mut l, spans) = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            let l = lower::lower(&parts(&st, &res))?;
+            (l, table_slots(&native.layout, &res))
         }
-        l => l?,
+        l => (l?, table_slots(&native.layout, res)),
     };
+    for u in &mut l.user_data {
+        if u.root == RootType::Table {
+            u.table_slots = spans.get(&u.slot).copied().flatten();
+        }
+    }
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -633,6 +675,35 @@ mod tests {
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
+
+    #[test]
+    fn table_slots_cover_choices_and_keep_dynamic_arrays() {
+        use resource::{Address, Descriptor, Resources, Role, Source};
+        let layout = [crate::RootParam {
+            root: RootType::Table, table_offset_dwords: 0, sgprs: 1,
+            base_register: 0, user_data: 4, slot: 3,
+        }];
+        let mut res = Resources {
+            scalar: vec![
+                ((0, 0), Address { param: 0, offset: 510 * 32, dynamic: None }),
+                ((0, 1), Address { param: 0, offset: 512 * 32, dynamic: None }),
+            ],
+            descriptors: vec![Descriptor {
+                site: (0, 2), role: Role::Resource,
+                source: Source::Select { scc: ir::Value(1), args: vec![
+                    Source::Loaded { load: (0, 0), first: 8 },
+                    Source::Loaded { load: (0, 1), first: 0 },
+                ] },
+            }],
+            ..Default::default()
+        };
+        assert_eq!(table_slots(&layout, &res)[&3], Some((511, 512)));
+        for i in 0..2 {
+            res.scalar[i].1.dynamic = Some(ir::Value(2));
+            assert_eq!(table_slots(&layout, &res)[&3], None);
+            res.scalar[i].1.dynamic = None;
+        }
+    }
 
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose

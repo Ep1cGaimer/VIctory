@@ -1596,6 +1596,7 @@ impl<'a> Lower<'a> {
             slot: rp.slot,
             root: rp.root,
             dword,
+            table_slots: None,
         })
     }
 
@@ -1619,6 +1620,7 @@ impl<'a> Lower<'a> {
             slot: rp.slot,
             root: RootType::Descriptor,
             dword: if uav { super::ROOT_UAV_VIEW } else { super::ROOT_SRV_VIEW },
+            table_slots: None,
         });
         let props = if uav { (11 | 0x1000, 0) } else { (11, 0) };
         let h = self.s.heap_handle(self.s.entry, i, false, false, props);
@@ -1643,6 +1645,7 @@ impl<'a> Lower<'a> {
             slot: rp.slot,
             root: RootType::Descriptor,
             dword: super::ROOT_VIEW_OFFSET,
+            table_slots: None,
         }))
     }
 

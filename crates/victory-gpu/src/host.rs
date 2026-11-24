@@ -1908,6 +1908,27 @@ struct Batch {
 }
 
 impl Batch {
+    fn new_gpu_write<T>(&mut self, shadow: &std::sync::Arc<T>, address: usize, len: usize) -> bool {
+        self.declared_writes
+            .insert((std::sync::Arc::as_ptr(shadow) as usize, address, len))
+    }
+
+    fn gpu_write(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        if self.new_gpu_write(shadow, address, len) {
+            // The first declaration needs the refreshed bytes for its snapshot.
+            // Another declaration of this exact range is already pending until
+            // the GPU submission finishes, so it needs no refresh boundary.
+            self.flush();
+            shadow.writing(address, len);
+            self.gpu_writes.push((shadow.clone(), address, len));
+        }
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
@@ -2910,6 +2931,21 @@ fn pump() {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    #[test]
+    fn exact_gpu_writes_are_declared_once_per_submission() {
+        let mut batch = Batch::default();
+        let (a, b) = (Arc::new(0), Arc::new(0));
+        assert!(batch.new_gpu_write(&a, 4096, 16));
+        assert!(!batch.new_gpu_write(&a.clone(), 4096, 16));
+        assert!(batch.new_gpu_write(&a, 4096, 32));
+        assert!(batch.new_gpu_write(&a, 4104, 16));
+        assert!(batch.new_gpu_write(&b, 4096, 16));
+        // CPU copies can flush refreshes, but these GPU writes stay pending.
+        batch.title_written();
+        assert!(!batch.new_gpu_write(&a, 4096, 16));
+        assert!(Batch::default().new_gpu_write(&a, 4096, 16));
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
