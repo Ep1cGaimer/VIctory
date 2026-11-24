@@ -220,18 +220,24 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// The lane's iterations of every loop together (private memory), which
+    /// [`LOOP_LIMIT`] bounds: per-loop counts multiply in nested loops.
+    budget: Option<V>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
 }
 
-/// Iterations after which a loop is left (per entry into it), unless
-/// [`super::loop_limit`] says otherwise. The console runs a loop as long as
-/// its data says; data the host has not mirrored yet (a null view reads
-/// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
-// shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+/// Loop iterations after which a lane leaves the program, counting every
+/// loop of it together, unless [`super::loop_limit`] says otherwise. The
+/// console runs a loop as long as its data says; data the host has not
+/// mirrored yet (a null view reads zeros), or a pass that waits on another
+/// the host dropped, can make that four billion iterations, which hangs the
+/// host GPU until the driver resets it. Counted per entry into each loop,
+/// nested loops multiplied the limit: a 2x2x1 world dispatch ran for 25 s.
+/// A lane that reaches the limit leaves the program as killed (a pixel
+/// discards).
+// shortcut: genuine work of more iterations than this is cut short too.
+pub(super) const LOOP_LIMIT: u32 = 1 << 16;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -514,6 +520,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            budget: None,
             abort: None,
         }
     }
@@ -845,6 +852,12 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
             }
+        }
+        if !self.counters.is_empty() {
+            let zero = self.s.m.i32(0);
+            let budget = self.s.m.private_global("loop.budget", zero);
+            self.s.m.store(self.s.entry, budget, zero);
+            self.budget = Some(budget);
         }
         self.cur = self.s.entry;
         self.find_sections();
@@ -6835,9 +6848,11 @@ impl<'a> Lower<'a> {
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
         let c = self.cur;
-        let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
-        let next = self.s.m.bin(c, Bin::Add, phi, one);
+        let budget = self.budget.expect("loops have a budget");
+        let spent = self.s.m.load(c, budget);
+        let next = self.s.m.bin(c, Bin::Add, spent, one);
+        self.s.m.store(c, budget, next);
         let limit = self.s.m.i32(super::loop_limit());
         self.counters
             .get_mut(&to)

@@ -442,6 +442,20 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store(4 * (d.y * 16 + d.x), s);
         }"#,
     ),
+    // The same in nested loops: the limit counts every loop of the lane
+    // together (counted per loop, the inner loop's would multiply by the
+    // outer's, 2^40 iterations at 2^20 each).
+    (
+        "terminates in nested loops",
+        r#"CS {
+            uint cnt = outb.Load(4 * 1000), s = d.x;
+            for (uint j = 0; j != cnt - 1; j++) {
+                for (uint m = 0; m != cnt - 2; m++) s = s * 3 + raw.Load(4 * ((j ^ m) & 31));
+                s ^= j;
+            }
+            outb.Store(4 * (d.y * 16 + d.x), s);
+        }"#,
+    ),
     // Cube sampling: the console computes face coordinates (`v_cube*`)
     // and samples the face; the host samples the direction rebuilt from
     // them. Every face and texel: a major axis of ±2 and the others at

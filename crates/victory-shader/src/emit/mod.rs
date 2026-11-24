@@ -99,11 +99,11 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
-/// The loop limit without an override: 2^20.
+/// The loop limit without an override: 2^16.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
-/// The iteration count after which a translated loop is left, per lane and
-/// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
+/// The loop iterations (per lane, every loop of the program together) after
+/// which a translated program is left: [`DEFAULT_LOOP_LIMIT`].
 ///
 /// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
 /// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
