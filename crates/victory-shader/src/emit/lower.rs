@@ -351,6 +351,15 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
         .collect()
 }
 
+/// Image instructions with implicit derivatives: over quads of lanes, which
+/// DXIL has in pixel shaders and (SM 6.6) in compute and mesh shaders.
+fn implicit_derivatives(name: &str) -> bool {
+    matches!(
+        name,
+        "image_sample" | "image_sample_o" | "image_sample_b" | "image_sample_c" | "image_get_lod"
+    )
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -411,8 +420,21 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
+            // Implicit derivatives: the console's quads are lanes 4n..4n+3
+            // (in whole-quad mode, `s_wqm`), and its waves hold runs of
+            // flat thread ids, so a quad is four consecutive flat ids, x
+            // across lanes 0-1 and y across 0-2. DXIL's quads are lanes
+            // 4n..4n+3 too, but only its 1D rule (numthreads X % 4 == 0,
+            // Y == Z == 1) makes them consecutive group indices; its 2D rule
+            // makes them 2x2 blocks of (x, y), with no defined place in a
+            // wave. So the host group is declared flat and thread ids are
+            // derived from the group index ([`Lower::thread_id`]).
+            let threads: u32 = cs.threads.iter().product();
+            if threads.is_multiple_of(4) && insts().any(|i| implicit_derivatives(i.name())) {
+                s.threads = Some([threads, 1, 1]);
+            }
             let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
+            let one_wave = threads <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
@@ -1903,11 +1925,18 @@ impl<'a> Lower<'a> {
     /// flat id is the wave's first lane's, rounded down to the wave size,
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
+    /// A host group declared flat ([`Lower::new`], for derivatives) gives
+    /// the console's ids from the group index likewise.
     fn thread_id(&mut self, c: u8) -> Val {
-        if !self.console_lanes {
+        let group = match self.x.native.io {
+            StageIo::Cs(cs) => cs.threads,
+            _ => self.s.threads.expect("compute"),
+        };
+        let flattened = self.s.threads != Some(group);
+        if !self.console_lanes && !flattened {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        let [x, y, _] = self.s.threads.expect("compute");
+        let [x, y, _] = group;
         let e = self.s.entry;
         let i32t = self.s.t.i32;
         let flat = self.s.op(
@@ -1918,20 +1947,24 @@ impl<'a> Lower<'a> {
             96,
             &[],
         );
-        let first = self.s.op(
-            e,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[flat],
-        );
-        let wave = self.s.wave_size.expect("set with console lanes");
-        let mask = self.s.m.i32(!(wave - 1));
-        let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.lane_index();
-        let f = self.s.m.bin(e, Bin::Add, base, lane);
-        self.s.flags |= flags::WAVE_OPS;
+        let f = if self.console_lanes {
+            let first = self.s.op(
+                e,
+                "waveReadLaneFirst.i32",
+                Attr::NoUnwind,
+                i32t,
+                118,
+                &[flat],
+            );
+            let wave = self.s.wave_size.expect("set with console lanes");
+            let mask = self.s.m.i32(!(wave - 1));
+            let base = self.s.m.bin(e, Bin::And, first, mask);
+            let lane = self.lane_index();
+            self.s.flags |= flags::WAVE_OPS;
+            self.s.m.bin(e, Bin::Add, base, lane)
+        } else {
+            flat
+        };
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
             0 => self.s.m.bin(e, Bin::URem, f, xk),
@@ -1941,6 +1974,27 @@ impl<'a> Lower<'a> {
             }
             _ => self.s.m.bin(e, Bin::UDiv, f, xy),
         })
+    }
+
+    /// Whether the stage and group shape give implicit derivatives the
+    /// console's quads (see [`Lower::new`]); then they are recorded.
+    fn derivatives_allowed(&mut self) -> Result<(), Why> {
+        let ok = match &self.x.native.io {
+            _ if self.s.pixel => true,
+            // Declared flat with whole quads, or 1D already.
+            StageIo::Cs(_) => self
+                .s
+                .threads
+                .is_some_and(|[x, y, z]| x.is_multiple_of(4) && y == 1 && z == 1),
+            // Mesh lanes are the console's: 1D, the group index.
+            StageIo::Ms(ms) => ms.threads.is_multiple_of(4),
+            _ => return Err("implicit derivatives outside pixel, compute and mesh shaders"),
+        };
+        if !ok {
+            return Err("implicit derivatives in a thread group of partial quads");
+        }
+        self.s.derivatives = true;
+        Ok(())
     }
 
     /// Mesh: the counts and the primitives no lane exports. The console's
@@ -6008,6 +6062,9 @@ impl<'a> Lower<'a> {
             );
             self.end_guarded(at, &[]);
             return Ok(());
+        }
+        if implicit_derivatives(name) {
+            self.derivatives_allowed()?;
         }
         let (op, sample) = match name {
             "image_sample" | "image_sample_o" => (60, true),
