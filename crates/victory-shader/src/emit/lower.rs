@@ -7344,6 +7344,47 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_reloaded_from_a_vgpr_lane_selects() {
+        // A compare result spilled to lane 0 of v1 and reloaded; a select
+        // on the reload feeds a branch (an effect needs it).
+        let words = [
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0
+            0xBE80_036A, // s_mov_b32 s0, vcc_lo
+            0xD761_0001,
+            0x0001_0000, // v_writelane_b32 v1, s0, 0
+            0xD760_0002,
+            0x0001_0101, // v_readlane_b32 s2, v1, 0
+            0xD501_0002,
+            0x0009_0280, // v_cndmask_b32 v2, 0, 1, s2
+            0x7D8A_0480, // v_cmp_ne_u32 vcc_lo, 0, v2
+            0xBF87_0001, // s_cbranch_vccnz -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let names: Vec<&str> = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .map(|i| i.name())
+            .collect();
+        assert_eq!(
+            names[..7],
+            [
+                "v_cmp_gt_u32",
+                "s_mov_b32",
+                "v_writelane_b32",
+                "v_readlane_b32",
+                "v_cndmask_b32",
+                "v_cmp_ne_u32",
+                "s_cbranch_vccnz"
+            ]
+        );
+        lowers(&words, 0).unwrap();
+    }
+
+    #[test]
     fn scalar_bit_tests_lower() {
         // Each tests one bit of a constant into SCC and branches on it (only
         // code with an effect needs its operands).

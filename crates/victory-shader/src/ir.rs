@@ -15,6 +15,8 @@
 //! operand's whole possible range: from the encoded register up to the
 //! program's VGPR count, all read (and all written, for a destination).
 
+use std::collections::{HashMap, HashSet};
+
 use crate::ShaderError;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
 
@@ -262,6 +264,9 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
         }
     }
     remove_trivial_phis(&mut blocks, values);
+    if forward_spills(&mut blocks, values, wave64) {
+        remove_trivial_phis(&mut blocks, values);
+    }
     Ok(Program {
         wave64,
         vgprs,
@@ -634,6 +639,156 @@ fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
             }
         }
     }
+}
+
+/// A constant lane select (`v_readlane_b32`, `v_writelane_b32` src1), as
+/// the hardware reads it: its low 5 (wave32) or 6 (wave64) bits.
+fn constant_lane(op: &Operand, wave64: bool) -> Option<u32> {
+    let k = match *op {
+        Operand::Const(c) => crate::resource::inline(c).filter(|_| c <= 208)?,
+        Operand::Literal(x) => x,
+        _ => return None,
+    };
+    Some(k & if wave64 { 63 } else { 31 })
+}
+
+/// SGPR spills to VGPR lanes: a `v_readlane_b32` at a constant lane whose
+/// every reaching write of that lane is a `v_writelane_b32` of the same
+/// scalar value reads that value, and its readers are given it instead.
+/// Both instructions ignore EXEC, so the lane holds exactly that dword; the
+/// value's definition dominates each of those writes, hence the read. A
+/// mask saved this way (EXEC, compare results) stays visible as a mask.
+/// Returns whether anything was forwarded.
+fn forward_spills(blocks: &mut [Block], values: u32, wave64: bool) -> bool {
+    #[derive(Clone, Copy)]
+    enum Def {
+        Inst(usize, usize),
+        Phi(usize, usize),
+    }
+    let mut defs: HashMap<Value, Def> = HashMap::new();
+    for (b, block) in blocks.iter().enumerate() {
+        for (i, phi) in block.phis.iter().enumerate() {
+            defs.insert(phi.value, Def::Phi(b, i));
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, v) in &inst.writes {
+                defs.insert(v, Def::Inst(b, i));
+            }
+        }
+    }
+    let find = |replaced: &[Value], mut v: Value| {
+        // A forwarded value may itself be a reload: each step goes to a
+        // value defined before the reload on every path, so chains end.
+        while replaced[v.0 as usize] != v {
+            v = replaced[v.0 as usize];
+        }
+        v
+    };
+    // The scalar value lane `lane` of VGPR value `v` holds, if every write
+    // of that lane reaching it writes that value (up to forwarding). A write
+    // of what the reload `own` itself reads keeps the lane as it was.
+    let source = |replaced: &[Value], v: Value, lane: u32, own: Value| -> Option<Value> {
+        let (mut seen, mut stack, mut found) = (HashSet::new(), vec![v], None);
+        while let Some(v) = stack.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            match *defs.get(&v)? {
+                Def::Phi(b, i) => stack.extend(&blocks[b].phis[i].args),
+                Def::Inst(b, i) => {
+                    let inst = &blocks[b].insts[i];
+                    let Fields::Valu(f) = &inst.fields else {
+                        return None;
+                    };
+                    let (Some(Operand::Vector { reg, dwords: 1 }), [data, sel]) =
+                        (f.dst, &f.src[..])
+                    else {
+                        return None;
+                    };
+                    if inst.name() != "v_writelane_b32" || f.dpp.is_some() || f.sdwa.is_some() {
+                        return None;
+                    }
+                    if constant_lane(sel, wave64)? != lane {
+                        stack.push(inst.read(Reg::V(reg))?);
+                        continue;
+                    }
+                    let Operand::Scalar { code, .. } = *data else {
+                        return None;
+                    };
+                    let s = find(replaced, inst.read(Reg::S(code))?);
+                    if s == own {
+                        continue;
+                    }
+                    if found.is_some_and(|f| f != s) {
+                        return None;
+                    }
+                    found = Some(s);
+                }
+            }
+        }
+        found
+    };
+    // (VGPR value read, lane, value written) per reload.
+    let mut reloads = Vec::new();
+    for block in blocks.iter() {
+        for inst in &block.insts {
+            let Fields::Valu(f) = &inst.fields else {
+                continue;
+            };
+            if inst.name() != "v_readlane_b32" || f.dpp.is_some() || f.sdwa.is_some() {
+                continue;
+            }
+            let (
+                Some(Operand::Scalar { code: dst, .. }),
+                [Operand::Vector { reg, dwords: 1 }, sel],
+            ) = (f.dst, &f.src[..])
+            else {
+                continue;
+            };
+            if let (Some(lane), Some(v), Some(out)) = (
+                constant_lane(sel, wave64),
+                inst.read(Reg::V(*reg)),
+                inst.write(Reg::S(dst)),
+            ) {
+                reloads.push((v, lane, out));
+            }
+        }
+    }
+    let mut replaced: Vec<Value> = (0..values).map(Value).collect();
+    let mut any = false;
+    // A reload of a value spilled again after an earlier reload resolves
+    // once that one has.
+    loop {
+        let mut progress = false;
+        for &(v, lane, out) in &reloads {
+            if replaced[out.0 as usize] == out
+                && let Some(s) = source(&replaced, v, lane, out)
+            {
+                replaced[out.0 as usize] = s;
+                progress = true;
+            }
+        }
+        if !progress {
+            break;
+        }
+        any = true;
+    }
+    if !any {
+        return false;
+    }
+    for block in blocks.iter_mut() {
+        for phi in &mut block.phis {
+            for a in &mut phi.args {
+                *a = find(&replaced, *a);
+            }
+        }
+        for inst in &mut block.insts {
+            for (_, v) in &mut inst.reads {
+                *v = find(&replaced, *v);
+            }
+        }
+    }
+    true
 }
 
 /// Scheduling hints, performance counters and tracing: no effect on results.
@@ -1041,6 +1196,104 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    // SGPR spills to VGPR lanes (`forward_spills`).
+    const WRITELANE_V1_S0_L0: [u32; 2] = [0xD761_0001, 0x0001_0000]; // v_writelane_b32 v1, s0, 0
+    const WRITELANE_V1_S1_L0: [u32; 2] = [0xD761_0001, 0x0001_0001]; // v_writelane_b32 v1, s1, 0
+    const WRITELANE_V1_S1_L1: [u32; 2] = [0xD761_0001, 0x0001_0201]; // v_writelane_b32 v1, s1, 1
+    const READLANE_S2_V1_L0: [u32; 2] = [0xD760_0002, 0x0001_0101]; // v_readlane_b32 s2, v1, 0
+    const READLANE_S2_V1_L1: [u32; 2] = [0xD760_0002, 0x0001_0301]; // v_readlane_b32 s2, v1, 1
+    const MOV_S3_S2: u32 = 0xBE83_0302; // s_mov_b32 s3, s2
+
+    /// What `s_mov_b32 s3, s2` (the last instruction before `s_endpgm`) reads.
+    fn reload_read(words: &[u32]) -> (Program, Value) {
+        let code: Vec<u32> = words.iter().copied().chain([MOV_S3_S2, S_ENDPGM]).collect();
+        let p = build_words(&code, false);
+        let last = p.blocks.iter().flat_map(|b| &b.insts).rev().nth(1).unwrap();
+        assert_eq!(last.name(), "s_mov_b32");
+        let v = last.read(Reg::S(2)).unwrap();
+        (p, v)
+    }
+
+    #[test]
+    fn a_reload_reads_the_spilled_value() {
+        let w = [WRITELANE_V1_S0_L0, READLANE_S2_V1_L0].concat();
+        let (p, v) = reload_read(&w);
+        let names: Vec<&str> = p.blocks[0].insts.iter().map(|i| i.name()).collect();
+        assert_eq!(names[..2], ["v_writelane_b32", "v_readlane_b32"]);
+        assert_eq!(v, input(&p, Reg::S(0)));
+    }
+
+    #[test]
+    fn a_reload_looks_past_other_lanes_and_takes_the_last_write() {
+        let other = [WRITELANE_V1_S0_L0, WRITELANE_V1_S1_L1, READLANE_S2_V1_L0].concat();
+        let (p, v) = reload_read(&other);
+        assert_eq!(v, input(&p, Reg::S(0)));
+        let lane1 = [WRITELANE_V1_S0_L0, WRITELANE_V1_S1_L1, READLANE_S2_V1_L1].concat();
+        let (p, v) = reload_read(&lane1);
+        assert_eq!(v, input(&p, Reg::S(1)));
+        let again = [WRITELANE_V1_S0_L0, WRITELANE_V1_S1_L0, READLANE_S2_V1_L0].concat();
+        let (p, v) = reload_read(&again);
+        assert_eq!(v, input(&p, Reg::S(1)));
+    }
+
+    #[test]
+    fn a_reload_stays_when_the_lane_may_hold_something_else() {
+        let readlane = |p: &Program| {
+            let r = p.blocks.iter().flat_map(|b| &b.insts);
+            r.clone()
+                .find(|i| i.name() == "v_readlane_b32")
+                .unwrap()
+                .write(Reg::S(2))
+                .unwrap()
+        };
+        // A full VGPR write in between.
+        let vmov = [WRITELANE_V1_S0_L0[0], WRITELANE_V1_S0_L0[1], 0x7E02_0280] // v_mov_b32 v1, 0
+            .into_iter()
+            .chain(READLANE_S2_V1_L0)
+            .collect::<Vec<_>>();
+        // Never written: the lane holds what the VGPR held on entry.
+        let unset = READLANE_S2_V1_L1.to_vec();
+        // A lane chosen at run time.
+        let dynamic = [WRITELANE_V1_S0_L0, [0xD760_0002, 0x0000_0901]].concat(); // v_readlane_b32 s2, v1, s4
+        // Different values on the two paths into the reload.
+        let paths = [
+            &WRITELANE_V1_S0_L0[..],
+            &[0xBF06_8005, 0xBF85_0002], // s_cmp_eq_u32 s5, 0; s_cbranch_scc1 past the next write
+            &WRITELANE_V1_S1_L0,
+            &READLANE_S2_V1_L0,
+        ]
+        .concat();
+        for w in [vmov, unset, dynamic, paths] {
+            let (p, v) = reload_read(&w);
+            assert_eq!(v, readlane(&p), "{w:x?}");
+        }
+        // The same value on both paths is forwarded.
+        let same = [
+            &WRITELANE_V1_S0_L0[..],
+            &[0xBF06_8005, 0xBF85_0002],
+            &WRITELANE_V1_S0_L0,
+            &READLANE_S2_V1_L0,
+        ]
+        .concat();
+        let (p, v) = reload_read(&same);
+        assert_eq!(v, input(&p, Reg::S(0)));
+    }
+
+    #[test]
+    fn a_value_spilled_again_after_its_reload_is_still_the_first() {
+        // The loop reloads lane 0 and writes the reload back each time.
+        let w = [
+            &WRITELANE_V1_S0_L0[..],
+            &READLANE_S2_V1_L0,          // loop:
+            &[0xD761_0001, 0x0001_0002], // v_writelane_b32 v1, s2, 0
+            &[0xBF06_8005, 0xBF85_FFFA], // s_cmp_eq_u32 s5, 0; s_cbranch_scc1 loop
+        ]
+        .concat();
+        let (p, v) = reload_read(&w);
+        assert_eq!(p.blocks.len(), 3);
+        assert_eq!(v, input(&p, Reg::S(0)));
     }
 
     #[test]
