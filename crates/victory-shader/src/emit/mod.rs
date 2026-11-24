@@ -187,6 +187,8 @@ mod bitcode;
 mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
+mod derivative_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;

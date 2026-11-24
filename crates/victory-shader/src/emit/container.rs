@@ -166,9 +166,13 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
+    /// Runtime info version 3 (validator 1.8): the entry function's name,
+    /// in the string table after the semantics' names.
+    pub entry_name: Option<&'a str>,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6).
+/// `PSV0` with runtime info version 2 (validator 1.6), or 3 with an entry
+/// name (validator 1.8).
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -184,8 +188,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[48]);
-    let mut info = [0u8; 48];
+    let info_size = if p.entry_name.is_some() { 52 } else { 48 };
+    u32s(&mut out, &[info_size]);
+    let mut info = [0u8; 52];
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
         // PSInfo.SampleFrequency: an input interpolated per sample, or the
@@ -224,7 +229,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[12] = u8::from(p.flag);
         info[26..28].copy_from_slice(&(max as u16).to_le_bytes());
     }
-    out.extend(info);
+    // EntryFunctionName (bytes 48-51) is patched in with the string table.
+    let name_at = out.len() + 48;
+    out.extend(&info[..info_size as usize]);
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
@@ -264,6 +271,11 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             None => (0, 0),
         };
         elements.push((name as u32, index as u32, start, e.cols | alloc, e));
+    }
+    if let Some(name) = p.entry_name {
+        let at = strings.len() as u32;
+        strings.extend(name.bytes().chain([0]));
+        out[name_at..name_at + 4].copy_from_slice(&at.to_le_bytes());
     }
     strings.resize(strings.len().next_multiple_of(4), 0);
     u32s(&mut out, &[strings.len() as u32]);

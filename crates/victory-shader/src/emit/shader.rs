@@ -1,6 +1,8 @@
 //! A DXIL vertex, pixel, compute or mesh shader under construction: the module,
 //! the `dx.op` declarations it calls, its signatures and bound resources,
-//! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
+//! and the metadata and container that wrap it up (SM 6.6, validator 1.6;
+//! 1.8 for compute and mesh shaders with implicit derivatives, which
+//! validators before 1.8 reject outside pixel shaders).
 
 use super::bitcode::{Attr, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
@@ -53,6 +55,9 @@ pub(crate) mod flags {
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
     pub const ATOMIC64_HEAP: u64 = 1 << 32;
+    /// Derivatives (implicit-LOD samples) in a mesh or amplification
+    /// shader; compute needs no flag (as DXC emits them).
+    pub const DERIVATIVES_MS_AS: u64 = 1 << 29;
 }
 
 pub(crate) struct Types {
@@ -127,6 +132,9 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// An operation with implicit derivatives (a sample with implicit
+    /// level, a level query) was emitted.
+    pub derivatives: bool,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -187,6 +195,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            derivatives: false,
             lds: None,
             main,
             entry,
@@ -793,6 +802,13 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        // Derivatives outside pixel shaders: validator 1.8 (PSV0 runtime
+        // info version 3), and in mesh shaders a shader flag and its
+        // feature bit, as DXC 1.8 emits them for cs_6_6 and ms_6_6.
+        let quad_derivatives = self.derivatives && self.threads.is_some();
+        if quad_derivatives && self.mesh.is_some() {
+            self.flags |= flags::DERIVATIVES_MS_AS;
+        }
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -854,7 +870,13 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        let valver = if quad_derivatives {
+            let eight = i32c(&mut self, 8);
+            self.m.md_node(vec![Some(one), Some(eight)])
+        } else {
+            version
+        };
+        self.m.named_md("dx.valver", vec![valver]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -906,6 +928,9 @@ impl Shader {
         if self.flags & flags::ATOMIC64_HEAP != 0 {
             features |= 0x1000_0000;
         }
+        if self.flags & flags::DERIVATIVES_MS_AS != 0 {
+            features |= 0x100_0000;
+        }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);
         let osg1 = container::signature(&self.outputs, false);
@@ -925,6 +950,7 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            entry_name: quad_derivatives.then_some("main"),
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
