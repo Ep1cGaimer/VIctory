@@ -263,6 +263,13 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// What descriptor dwords read as numbers stop with: an address, format or
+/// tiling field (no host value), a descriptor no view operand uses (no kind
+/// to query), a sampler's.
+const DESCRIPTOR_FIELD: Why = "a descriptor's address or format read as data";
+const DESCRIPTOR_UNUSED: Why = "a descriptor read only as data";
+const SAMPLER_DATA: Why = "a sampler descriptor read as data";
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -2928,6 +2935,149 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// The view a descriptor read as data has, from the resource operand
+    /// at `at` that a load of it supplies: properties for its handle, and the
+    /// resource kind if an image.
+    fn data_view(
+        &self,
+        at: Site,
+        used: Option<&UsedResource>,
+        uav: bool,
+    ) -> Result<((u32, u32), Option<u32>), Why> {
+        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+        let un = ui.name();
+        let u = if uav { 0x1000 } else { 0 };
+        match &ui.fields {
+            Fields::Image { dim, .. } => {
+                let kind = match dim {
+                    0 => 1,
+                    1 => 2,
+                    2 => 4,
+                    4 => 6,
+                    5 => 7,
+                    _ => return Err("an image dimension (cube or MSAA)"),
+                };
+                Ok(((kind | u, 0x409), Some(kind)))
+            }
+            Fields::Buffer { idxen, format, .. } => {
+                let stride = used.map_or(0, |u| u.stride);
+                let props = if un.starts_with("buffer_load_format")
+                    || un.starts_with("buffer_store_format")
+                {
+                    (10 | u, 0x409)
+                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                    (12 | u, stride)
+                } else {
+                    (11 | u, 0)
+                };
+                Ok((props, None))
+            }
+            _ => Err("a scalar memory read as data"),
+        }
+    }
+
+    /// The resource operands that other loads of the descriptor the scalar
+    /// load at `site` (of `count` dwords) reads supply, and the dword of
+    /// this load the descriptor starts at. Another load reads the same
+    /// descriptor when its address has the same root parameter, the same
+    /// constant and the same computed term: the same value, or the first
+    /// active lane's copy of the same vector value (each of a waterfall
+    /// loop's iterations takes one lane's index; the heap entry a lane
+    /// indexes has one kind of view wherever the program reads it).
+    fn twin_uses(&self, site: Site, count: u32) -> Result<(Vec<Site>, u8), Why> {
+        // shortcut: the first-lane copies are taken to meet the same entry
+        // even when taken under different exec masks, where the first lane
+        // (and so the entry) can differ; the views would then be of two
+        // descriptors, which a heap the program indexes this way is taken to
+        // hold with the same kind.
+        let a = *self.scalar.get(&site).ok_or(DESCRIPTOR_UNUSED)?;
+        let mut uses = Vec::new();
+        let mut at_dword = None;
+        for d in self
+            .x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Resource)
+        {
+            for l in d.source.leaves() {
+                let Source::Loaded { load, first } = *l else {
+                    continue;
+                };
+                if load == site {
+                    continue;
+                }
+                let Some(b) = self.scalar.get(&load) else {
+                    continue;
+                };
+                if b.param != a.param || !self.same_term(a.dynamic, b.dynamic) {
+                    continue;
+                }
+                // Byte distance from this load's first dword to the descriptor.
+                let rel = b
+                    .offset
+                    .wrapping_add(4 * u32::from(first))
+                    .wrapping_sub(a.offset);
+                if rel % 4 != 0 || rel / 4 >= count {
+                    continue;
+                }
+                let k = (rel / 4) as u8;
+                if at_dword.is_some_and(|f| f != k) {
+                    return Err("a load of dwords of two descriptors read as data");
+                }
+                at_dword = Some(k);
+                uses.push(d.site);
+            }
+        }
+        match at_dword {
+            Some(first) => Ok((uses, first)),
+            None if self.x.res.descriptors.iter().any(|d| {
+                d.role == Role::Sampler
+                    && d.source
+                        .leaves()
+                        .iter()
+                        .any(|l| matches!(**l, Source::Loaded { load, .. } if load == site))
+            }) =>
+            {
+                Err(SAMPLER_DATA)
+            }
+            None => Err(DESCRIPTOR_UNUSED),
+        }
+    }
+
+    /// Two computed address terms are the same index: equal, or both the
+    /// first active lane's copy (`v_readfirstlane_b32`) of one vector value.
+    fn same_term(&self, x: Option<Value>, y: Option<Value>) -> bool {
+        match (x, y) {
+            (None, None) => true,
+            (Some(x), Some(y)) => {
+                x == y
+                    || matches!((self.first_lane_of(x), self.first_lane_of(y)), (Some(p), Some(q)) if p == q)
+            }
+            _ => false,
+        }
+    }
+
+    /// The vector value whose first active lane `v` copies, if
+    /// `v_readfirstlane_b32` writes it.
+    fn first_lane_of(&self, v: Value) -> Option<Value> {
+        let b = *self.def_block.get(&v)?;
+        let i = self.x.p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        if i.name() != "v_readfirstlane_b32" {
+            return None;
+        }
+        let Fields::Valu(f) = &i.fields else {
+            return None;
+        };
+        match f.src.first()? {
+            Operand::Vector { reg, .. } => i.read(Reg::V(*reg)),
+            _ => None,
+        }
+    }
+
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
@@ -2941,7 +3091,6 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -2957,8 +3106,10 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar memory read as data"),
         };
-        // How the program uses the descriptor tells the view's kind.
-        let use_at = self
+        // How the program uses the descriptor tells the view's kind: a
+        // resource operand this load supplies, else those that other loads of
+        // the same descriptor supply.
+        let direct = self
             .x
             .res
             .descriptors
@@ -2970,47 +3121,29 @@ impl<'a> Lower<'a> {
                     _ => None,
                 })
             });
-        let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
+        let (uses, first) = match direct {
+            Some((at, first)) => (vec![at], first),
+            None => self.twin_uses(site, count)?,
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
+        let uav = used.is_some_and(|u| u.kind == ResourceType::Uav)
+            || uses.iter().any(|&(b, i)| {
+                let n = self.x.p.blocks[b].insts[i].name();
+                n.contains("store") || n.contains("atomic")
+            });
+        let mut view = None;
+        for &at in &uses {
+            let v = self.data_view(at, used, uav)?;
+            if view.is_some_and(|w| w != v) {
+                return Err("a descriptor read as data that its loads use as different views");
             }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                (props, None)
-            }
-            _ => return Err("a scalar memory read as data"),
-        };
+            view = Some(v);
+        }
+        let (props, image) = view.ok_or(DESCRIPTOR_UNUSED)?;
+        if image.is_none() && used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+            return Err("a constant buffer's descriptor read as data");
+        }
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -3069,7 +3202,7 @@ impl<'a> Lower<'a> {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                        self.vals.insert(v, Val::Missing(DESCRIPTOR_FIELD));
                     }
                 }
             }
@@ -6985,6 +7118,15 @@ impl<'a> Lower<'a> {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                        // A join of a descriptor's dwords with data: register
+                        // reuse where the value is undefined in the source on
+                        // that edge, as a rule, but nothing here proves it.
+                        let why = match why {
+                            DESCRIPTOR_FIELD => "a descriptor's address or format joined with data",
+                            DESCRIPTOR_UNUSED => "a descriptor no view uses joined with data",
+                            SAMPLER_DATA => "a sampler descriptor joined with data",
+                            w => w,
+                        };
                         return Err(Stop::Retry(phi.value, why));
                     }
                     _ if self.read_phis.contains(&phi.value) => {
