@@ -6955,7 +6955,12 @@ mod tests {
         ];
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = ir::build(&code, false, 256).unwrap();
-        let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
+        let names: Vec<&str> = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .map(|i| i.name())
+            .collect();
         assert_eq!(
             names[..7],
             [
