@@ -82,6 +82,7 @@ Use the harness in `tools/lab/`: `run-probe.ps1` is the launcher and `gpumem.ps1
 
 ## What this branch did (newest first)
 
+- **a14fee5 + census** Host textures can be let go when idle (`VICTORY_TEXTURE_IDLE_S`, opt-in). A census by holder and the card's memory budget are logged once a second. Result: 4.2 of 4.9 GB are targets with distinct title memory, so there is nothing to let go while loading. The watchdog crash after the first 2.7 s submission is the blocker before the world. See `docs/memory-footprint-2026-11-26.md`, step 2.
 - **e5ee3ce** Compute and mesh shaders can emit implicit texture derivatives with validator 1.8. Compute groups use a flat host layout so the original console quads stay intact. The full archive validates **2,212 compute programs** (+534), with vertex/pixel and mesh counts unchanged. This measures DXIL validation. The host can still refuse a compute pipeline that requires a 64-lane wave.
 - **8f7f5c3** Decode all three packed mesh vertex indices as nine bits. The adjacent edge flag is independent of each index.
 - **8ec9285** Mesh shaders keep exports under the declared maxima and cull primitives with indices past `max_vertices`. Xbox clips out-of-range exports. The host leaves them undefined.

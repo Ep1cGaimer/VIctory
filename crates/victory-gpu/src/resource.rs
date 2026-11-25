@@ -1175,16 +1175,24 @@ fn references(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 /// for lately, free and idle (`VICTORY_TEXTURE_IDLE_S`, a minute if unset).
 #[cfg(windows)]
 static CENSUS: std::sync::Mutex<[(u64, u64); 6]> = std::sync::Mutex::new([(0, 0); 6]);
+/// Title target textures (rendered to, depth or unordered access), the bytes
+/// of title memory they lay over, and of it the distinct bytes.
+#[cfg(windows)]
+static TARGET_SPANS: std::sync::Mutex<(u64, u64, u64)> = std::sync::Mutex::new((0, 0, 0));
 /// Host textures let go so far and their bytes.
 #[cfg(windows)]
 static LET_GO: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-/// The last sweep's [`CENSUS`] and the host textures let go so far (count,
-/// bytes).
+/// The last sweep's [`CENSUS`], the host textures let go so far (count,
+/// bytes) and [`TARGET_SPANS`].
 #[cfg(windows)]
-pub(crate) fn census() -> ([(u64, u64); 6], (u64, u64)) {
+pub(crate) fn census() -> ([(u64, u64); 6], (u64, u64), (u64, u64, u64)) {
     use std::sync::atomic::Ordering::Relaxed;
-    (*CENSUS.lock().unwrap_or_else(|e| e.into_inner()), (LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)))
+    (
+        *CENSUS.lock().unwrap_or_else(|e| e.into_inner()),
+        (LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)),
+        *TARGET_SPANS.lock().unwrap_or_else(|e| e.into_inner()),
+    )
 }
 
 /// Once a second: counts where host texture bytes are ([`CENSUS`]) and,
@@ -1215,6 +1223,7 @@ pub(crate) fn let_go_idle() {
     }
     let mut census = [(0u64, 0u64); 6];
     let mut gone = Vec::new();
+    let mut spans: Vec<(u64, u64)> = Vec::new();
     {
         // Held throughout: a title texture leaving waits for it (its drop
         // takes this lock before its fields go). Host locks are only tried
@@ -1223,6 +1232,11 @@ pub(crate) fn let_go_idle() {
         let mut groups: std::collections::HashMap<usize, Group> = std::collections::HashMap::new();
         for &r in map.values().flatten() {
             let title = resource(r as This);
+            if title.desc.flags & TARGET_DEPTH_UNORDERED as u32 != 0
+                && let Some(f) = footprint(&title.desc)
+            {
+                spans.push((title.data() as u64, f.size));
+            }
             let Ok(host) = title.host.try_lock() else { continue };
             let Some(copy) = host.as_ref() else { continue };
             let group = groups.entry(Arc::as_ptr(copy) as usize).or_insert_with(|| Group {
@@ -1259,6 +1273,19 @@ pub(crate) fn let_go_idle() {
         }
     }
     *CENSUS.lock().unwrap_or_else(|e| e.into_inner()) = census;
+    // How much title memory the targets take, and how much of it is shared
+    // (the console's targets alias where their uses do not overlap).
+    spans.sort_unstable();
+    let (mut union, mut end) = (0u64, 0u64);
+    let sum = spans.iter().map(|s| s.1).sum::<u64>();
+    for &(start, len) in &spans {
+        let stop = start.saturating_add(len);
+        if stop > end {
+            union += stop - start.max(end);
+            end = stop;
+        }
+    }
+    *TARGET_SPANS.lock().unwrap_or_else(|e| e.into_inner()) = (spans.len() as u64, sum, union);
     for copy in gone {
         LET_GO[0].fetch_add(1, Relaxed);
         LET_GO[1].fetch_add(copy.bytes, Relaxed);

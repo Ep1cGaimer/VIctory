@@ -3383,20 +3383,23 @@ pub(crate) mod mem {
             mb(commit),
             mb(working)
         );
-        let (census, (gone, gone_bytes)) = crate::resource::census();
+        let (census, (gone, gone_bytes), (targets, spans, distinct)) = crate::resource::census();
         let part = |i: usize| format!("{} {:.0} MB", census[i].0, mb(census[i].1));
         let card = super::video_memory().map_or(String::from("unknown"), |(used, budget, other)| {
             format!("local {:.0} MB of a {:.0} MB budget, system {:.0} MB", mb(used), mb(budget), mb(other))
         });
         tracing::info!(
-            "host textures by holder: targets {}, host-written {}, lists {}, slots only {}, free and lately used {}, free and idle {}; let go {gone} ({:.0} MB); card memory {card}",
+            "host textures by holder: targets {}, host-written {}, lists {}, slots only {}, free and lately used {}, free and idle {}; let go {gone} ({:.0} MB); card memory {card}; \
+             {targets} title targets lay over {:.0} MB of title memory, {:.0} MB of it distinct",
             part(0),
             part(1),
             part(2),
             part(3),
             part(4),
             part(5),
-            mb(gone_bytes)
+            mb(gone_bytes),
+            mb(spans),
+            mb(distinct)
         );
     }
 }

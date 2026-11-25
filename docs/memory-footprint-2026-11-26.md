@@ -90,6 +90,30 @@ The old `host::mem` counters were cumulative ("made"). The new "host memory live
 - So: view copies (0.3 GB) and the snapshot pool (0) are not where the memory is. Loose windows are, and the switches already cut 2.3 GB of them.
 - What remains in the 19.5 GB is mostly the title's own memory plus about 3.5 GB of copies; textures sit in VRAM and spill. Zero-copy can remove the copies, but the title's memory stays.
 
+## Step 2: host textures (2026-11-26, build a14fee5 and the census after it, `tex-C` / `tex-D`)
+- **What changed.** A title texture now holds its host texture in a mutex, not a `OnceLock`, so it can be taken away. `host_resource` returns an owned reference.
+- **Census.** Once a second it counts host textures by what holds them, together with `QueryVideoMemoryInfo`. It also adds up the title memory that target textures lay over.
+- **Opt-in release.** `VICTORY_TEXTURE_IDLE_S` lets go of textures that the title fills, the host never wrote, and no list or slot has asked for in that long, through `host::retire`. `VICTORY_TEXTURE_BUDGET_PCT` limits that to when local use is above that share of the budget.
+- **Measured** about 90 s in, still loading:
+
+| Holder | Textures | MB |
+|---|---|---|
+| Targets (render, depth, unordered access) | 1,187 | 4,230 |
+| Named by lists now | 7 | 7 |
+| Descriptor slots only | 61 | 83 |
+| Host-written | 9 | 6 |
+| Free (what the idle release can take) | 1 | 0 |
+
+- **What it means:**
+  - The idle release has nothing to take. Its census bucket is empty, and `tex-C` with it on let go of 0.
+  - Targets lay over 4,007 MB of title memory, and 3,845 MB of it is distinct. So the title's targets hardly alias one another, and putting them on heaps that mirror title memory would save only about 4 %.
+  - The card has 5.3 GB local in use against a 7.2 GB budget, plus 4.5 GB of system memory. VRAM is not oversubscribed while loading.
+  - The working set is 3–6 GB of 15.3 GB. RAM is not short while loading either. The 19 GB commit is a limit question, not a paging one, until the world.
+- **Step 2 stops here.** Textures are not where loading time goes. The release stays opt-in for the world, where streaming may change the picture.
+- **Both runs ended on the game's watchdog.** Each crashed at `+0x23cf683` (frame #1 `+0x2215c35`) right after the first big submission, which took 2.7 s:
+  - It existed before this build: `v2-viewaddr-x` (older build) crashed the same way after 2,707 ms, and `mem-B-evict` survived 2,702 ms.
+  - It is a race against the watchdog. The fix is making that first submission shorter (32 lists of compute: copies, 564 ms of preparing in one frame), not memory.
+
 ## More references (from the user's research agents, 2026-11-26; checked only where noted)
 - **fxceless's fork (its pushed main, GPL-3.0; reviewed in part):** `resource.rs` `room()` and `let_go_idle()`, a texture budget from `QueryVideoMemoryInfo` with a 2 GiB floor, at 90 % of budget. It sweeps idle textures the title fills and the host never wrote, if no list or slot holds them. Also `texture.rs` `let_go_idle` for staging, `HostHeap::texture_slot_gone`, a snapshot pool capped at 512 MiB, `VICTORY_WINDOW_KB`/`VICTORY_WINDOW_TAILS`, and card buffers. Reported to carry an RTX 3050 8 GB for 90 minutes at 1–3 fps with a large pagefile.
 - **XCL (GPL-2.0-only; ideas only, see below):** a self-sizing coherent heap with its size remembered between runs (`cache/uma_coherent.txt`), sparse VRAM windows through `UpdateTileMappings`, and batched write-watch.
