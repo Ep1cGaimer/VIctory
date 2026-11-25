@@ -1184,8 +1184,8 @@ static TARGET_SPANS: std::sync::Mutex<(u64, u64, u64)> = std::sync::Mutex::new((
 static LET_GO: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The last sweep's [`CENSUS`], the host textures let go so far (count,
-/// bytes) and [`TARGET_SPANS`].
-#[cfg(windows)]
+/// bytes) and [`TARGET_SPANS`] (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn census() -> ([(u64, u64); 6], (u64, u64), (u64, u64, u64)) {
     use std::sync::atomic::Ordering::Relaxed;
     (

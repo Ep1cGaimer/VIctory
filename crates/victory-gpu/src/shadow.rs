@@ -957,6 +957,15 @@ pub(crate) fn evicted() -> (u64, u64) {
     (EVICTED[0].load(Relaxed), EVICTED[1].load(Relaxed))
 }
 
+/// Loose windows let go of because a wider one holds them (count, bytes).
+static SUPERSEDED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn superseded() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (SUPERSEDED[0].load(Relaxed), SUPERSEDED[1].load(Relaxed))
+}
+
 /// Gives up loose windows no lookup found for `VICTORY_LOOSE_IDLE_S`
 /// seconds, then the least recently found while they hold more than
 /// `VICTORY_LOOSE_CAP_MB` (both 0, off, by default). Only windows nothing
@@ -974,9 +983,6 @@ pub(crate) fn evict_loose(held: impl Fn(usize) -> usize) {
     let &(idle, cap) = LIMITS.get_or_init(|| {
         (crate::switch::number("VICTORY_LOOSE_IDLE_S", 0) * 1000, crate::switch::number("VICTORY_LOOSE_CAP_MB", 0) << 20)
     });
-    if idle == 0 && cap == 0 {
-        return;
-    }
     let now = clock();
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let free = |s: &Arc<Shadow>| {
@@ -985,6 +991,37 @@ pub(crate) fn evict_loose(held: impl Fn(usize) -> usize) {
             && s.before.lock().unwrap_or_else(|e| e.into_inner()).0.is_empty()
     };
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    // Windows inside another one are superseded: lookups find the wider one
+    // (`loose`), so they only cost memory (a window of the same start and a
+    // longer reach, or of a later start a reach crossed into, holds the same
+    // title pages twice: a third of loose copy memory in the world). They go
+    // once nothing but page tables holds them, whatever the limits.
+    {
+        let mut by_start: Vec<(u64, std::cmp::Reverse<u64>)> = map.keys().map(|&(s, l)| (s, std::cmp::Reverse(s + l))).collect();
+        by_start.sort_unstable();
+        let mut reach = 0;
+        let mut inside: Vec<(u64, u64)> = Vec::new();
+        for (s, std::cmp::Reverse(e)) in by_start {
+            if e <= reach {
+                inside.push((s, e - s));
+            }
+            reach = reach.max(e);
+        }
+        for k in inside {
+            if map.get(&k).is_some_and(|s| free(s)) {
+                gone.extend(map.remove(&k));
+            }
+        }
+        if !gone.is_empty() {
+            SUPERSEDED[0].fetch_add(gone.len() as u64, Relaxed);
+            SUPERSEDED[1].fetch_add(gone.iter().map(|s| s.len).sum(), Relaxed);
+            changed();
+        }
+        gone.clear();
+    }
+    if idle == 0 && cap == 0 {
+        return;
+    }
     if idle > 0 {
         let old: Vec<(u64, u64)> = map
             .iter()
@@ -1193,6 +1230,73 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         VIEWS[3].fetch_max(len, Relaxed);
     }
     Some(shadow)
+}
+
+/// Where the live copies' title memory lives (diagnostics): copy bytes of
+/// buffers and of loose windows over private memory (the runtime's
+/// write-watched pools, which the GPU could read in place) and over mapped
+/// memory (page-pool views), and the private allocations holding them: how
+/// many, how big, how much of them committed (what opening them in place
+/// would pin).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn backing() -> String {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let query = |a: usize| {
+        // SAFETY: a plain query of our own address space into a sized structure.
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        let n = unsafe { VirtualQuery(a as *const _, &mut m, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        (n != 0).then_some(m)
+    };
+    let copies: Vec<(u64, u64, usize)> = all().iter().map(|s| (s.start, s.len, s.kind)).collect();
+    // [private, mapped, other] by [whole, loose].
+    let mut by = [[0u64; 2]; 3];
+    let mut bases: std::collections::HashMap<usize, ()> = std::collections::HashMap::new();
+    for (start, len, kind) in copies {
+        let Some(m) = query(start as usize) else { continue };
+        let at = match m.Type {
+            MEM_PRIVATE => {
+                bases.insert(m.AllocationBase as usize, ());
+                0
+            }
+            MEM_MAPPED => 1,
+            _ => 2,
+        };
+        by[at][kind.min(1)] += len;
+    }
+    let (mut size, mut committed, mut regions) = (0u64, 0u64, 0u64);
+    let mut biggest: Vec<(u64, u64)> = Vec::new();
+    for &base in bases.keys() {
+        let (mut a, mut c) = (base, 0u64);
+        while let Some(m) = query(a) {
+            if m.AllocationBase as usize != base || m.RegionSize == 0 {
+                break;
+            }
+            if m.State == MEM_COMMIT {
+                c += m.RegionSize as u64;
+            }
+            regions += 1;
+            a += m.RegionSize;
+        }
+        size += (a - base) as u64;
+        committed += c;
+        biggest.push(((a - base) as u64, c));
+    }
+    biggest.sort_unstable_by(|x, y| y.cmp(x));
+    let mb = |b: u64| b as f64 / 1048576.0;
+    format!(
+        "copies over private memory: buffers {:.0} MB, loose {:.0} MB; over mapped: buffers {:.0} MB, loose {:.0} MB; elsewhere {:.0} MB; \
+         in {} private allocations of {:.0} MB ({:.0} MB committed, {regions} regions; biggest {})",
+        mb(by[0][0]),
+        mb(by[0][1]),
+        mb(by[1][0]),
+        mb(by[1][1]),
+        mb(by[2][0] + by[2][1]),
+        bases.len(),
+        mb(size),
+        mb(committed),
+        biggest.iter().take(6).map(|(s, c)| format!("{:.0}/{:.0} MB", mb(*s), mb(*c))).collect::<Vec<_>>().join(", ")
+    )
 }
 
 /// Every host copy of title memory made so far (buffers and windows).

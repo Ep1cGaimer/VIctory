@@ -346,6 +346,209 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Probe (`cargo test -p victory-gpu evict_probe -- --ignored --nocapture`):
+    /// whether evicting shared copies (CPU-visible system memory buffers)
+    /// unpins them, whether their mapped pointers still work while evicted,
+    /// and what making them resident again costs.
+    #[test]
+    #[ignore = "uses the GPU and 1 GB of RAM; a measurement"]
+    fn evict_probe() {
+        use windows::Win32::Graphics::Direct3D12::{ID3D12Device3, ID3D12Pageable};
+        use windows::core::Interface;
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let host = super::host().expect("a host device");
+        let mb = |b: u64| b as f64 / 1048576.0;
+        let state = |what: &str| {
+            let mut s = MEMORYSTATUSEX {
+                dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: a sized structure.
+            unsafe { GlobalMemoryStatusEx(&mut s) };
+            let (local, budget, other) = super::video_memory().unwrap_or_default();
+            println!(
+                "{what}: RAM available {:.0} MB; card local {:.0} of {:.0} MB, system {:.0} MB",
+                mb(s.ullAvailPhys),
+                mb(local),
+                mb(budget),
+                mb(other)
+            );
+        };
+        // SAFETY: a plain query of the live device.
+        let adapter = unsafe { host.device.GetAdapterLuid() };
+        println!("adapter luid {:?}", (adapter.HighPart, adapter.LowPart));
+        state("before");
+        const SIZE: u64 = 128 << 20;
+        let buffers: Vec<_> = (0..8).map(|_| host.shared_buffer(SIZE).expect("a shared buffer")).collect();
+        for (i, (_, data)) in buffers.iter().enumerate() {
+            // SAFETY: a mapped buffer of SIZE bytes.
+            unsafe { std::ptr::write_bytes(*data, i as u8 + 1, SIZE as usize) };
+        }
+        state("made and written (1 GB)");
+        // Whether the copies count as private or mapped memory, and whether
+        // a trim can take them while resident and while evicted.
+        #[cfg(feature = "diagnostics")]
+        let space = |what: &str| {
+            let s = super::mem::address_space();
+            println!(
+                "{what}: private {:.0} MB ({:.0} resident), mapped {:.0} MB ({:.0}), image {:.0} MB ({:.0})",
+                mb(s[0].0), mb(s[0].1), mb(s[1].0), mb(s[1].1), mb(s[2].0), mb(s[2].1)
+            );
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let space = |_: &str| {};
+        let trim = || {
+            // SAFETY: trims this process's own working set.
+            unsafe {
+                windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                )
+            };
+        };
+        space("copies resident");
+        trim();
+        space("trimmed while resident");
+        let pageables: Vec<Option<ID3D12Pageable>> = buffers.iter().map(|(b, _)| b.cast().ok()).collect();
+        let started = std::time::Instant::now();
+        // SAFETY: live resources no list uses.
+        let evicted = unsafe { host.device.Evict(&pageables) };
+        println!("evict: {evicted:?} in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        state("evicted");
+        space("evicted");
+        trim();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        space("trimmed while evicted");
+        state("trimmed while evicted");
+        // Writes through the mapped pointers while evicted.
+        let started = std::time::Instant::now();
+        for (i, (_, data)) in buffers.iter().enumerate() {
+            // SAFETY: as above; the probe is whether this works.
+            unsafe { std::ptr::write_bytes(*data, i as u8 + 0x11, SIZE as usize) };
+        }
+        println!("written while evicted in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+        state("written while evicted");
+        let started = std::time::Instant::now();
+        // SAFETY: live resources.
+        let resident = unsafe { host.device.MakeResident(&pageables) };
+        println!("make resident: {resident:?} in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+        state("resident again");
+        let intact = buffers.iter().enumerate().all(|(i, (_, data))| {
+            // SAFETY: as above.
+            let s = unsafe { std::slice::from_raw_parts(*data, SIZE as usize) };
+            s.iter().step_by(4096).all(|&b| b == i as u8 + 0x11)
+        });
+        println!("contents after: {}", if intact { "intact" } else { "changed" });
+        // Enqueued residency (Device3), without waiting.
+        if let Ok(d3) = host.device.cast::<ID3D12Device3>() {
+            // SAFETY: as above.
+            let _ = unsafe { host.device.Evict(&pageables) };
+            let started = std::time::Instant::now();
+            // SAFETY: as above; no fence to signal.
+            let enqueued = unsafe {
+                d3.EnqueueMakeResident(
+                    windows::Win32::Graphics::Direct3D12::D3D12_RESIDENCY_FLAG_NONE,
+                    &pageables,
+                    &host.fence,
+                    1u64 << 40,
+                )
+            };
+            println!("enqueue make resident: {enqueued:?} in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+        }
+        // Pinning: trimmed pages the GPU holds resident stay in RAM; evicted
+        // ones go to the page file. Half resident, half evicted, trimmed,
+        // then the resident half evicted.
+        let (hot, cold) = pageables.split_at(4);
+        // SAFETY: as above.
+        let _ = unsafe { host.device.MakeResident(hot) };
+        // SAFETY: as above.
+        let _ = unsafe { host.device.Evict(cold) };
+        for (i, (_, data)) in buffers.iter().enumerate() {
+            // SAFETY: as above.
+            unsafe { std::ptr::write_bytes(*data, i as u8 + 0x21, SIZE as usize) };
+        }
+        state("half resident, all written");
+        trim();
+        for s in [2, 5, 10] {
+            std::thread::sleep(std::time::Duration::from_secs(if s == 2 { 2 } else { s / 2 }));
+            state(&format!("trimmed, {s} s later"));
+        }
+        // SAFETY: as above.
+        let _ = unsafe { host.device.Evict(hot) };
+        for s in [2, 5, 10] {
+            std::thread::sleep(std::time::Duration::from_secs(if s == 2 { 2 } else { s / 2 }));
+            state(&format!("resident half evicted, {s} s later"));
+        }
+        drop(pageables);
+        drop(buffers);
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        state("released");
+    }
+
+    /// Probe: whether the GPU can be given the title's write-watched private
+    /// memory in place (`OpenExistingHeapFromAddress`), with some of its
+    /// blocks read-only as change tracking leaves them, and what it pins.
+    #[test]
+    #[ignore = "uses the GPU; a measurement"]
+    fn in_place_probe() {
+        use windows::Win32::Graphics::Direct3D12::{ID3D12Device3, ID3D12Heap};
+        use windows::core::Interface;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc2, VirtualFree, VirtualProtect,
+        };
+        let host = super::host().expect("a host device");
+        let d3 = host.device.cast::<ID3D12Device3>().expect("Device3");
+        let mb = |b: u64| b as f64 / 1048576.0;
+        let card = |what: &str| {
+            let (local, _, other) = super::video_memory().unwrap_or_default();
+            println!("{what}: card local {:.0} MB, system {:.0} MB", mb(local), mb(other));
+        };
+        const SIZE: usize = 256 << 20;
+        for (watch, guard) in [(false, false), (true, false), (false, true), (true, true)] {
+            let kind = MEM_RESERVE | MEM_COMMIT | if watch { 0x20_0000 } else { 0 };
+            // SAFETY: a fresh allocation of our own.
+            let at = unsafe {
+                VirtualAlloc2(std::ptr::null_mut(), std::ptr::null(), SIZE, kind, PAGE_READWRITE, std::ptr::null_mut(), 0)
+            };
+            assert!(!at.is_null());
+            // SAFETY: inside the allocation.
+            unsafe { std::ptr::write_bytes(at.cast::<u8>(), 7, SIZE) };
+            let mut old = 0;
+            for block in (0..SIZE).step_by(1 << 20).filter(|_| guard) {
+                // SAFETY: inside the allocation.
+                unsafe { VirtualProtect(at.cast::<u8>().add(block).cast(), 1 << 16, PAGE_READONLY, &mut old) };
+            }
+            card(&format!("write watch {watch}, read-only blocks {guard}: allocated"));
+            let started = std::time::Instant::now();
+            // SAFETY: a live allocation of ours, kept until the heap goes.
+            let opened = unsafe { d3.OpenExistingHeapFromAddress::<ID3D12Heap>(at) };
+            println!("open: {:?} in {:.1} ms", opened.as_ref().err(), started.elapsed().as_secs_f64() * 1e3);
+            let heap = opened.ok();
+            if let Some(h) = &heap {
+                // SAFETY: a live heap.
+                let desc = unsafe { h.GetDesc() };
+                println!("heap of {:.0} MB", mb(desc.SizeInBytes));
+                card("opened");
+                // SAFETY: inside the allocation, a writable block.
+                unsafe { at.cast::<u8>().add(1 << 17).write(9) };
+                println!("CPU write after open: fine");
+                // Change tracking's guards after opening: allowed, and do
+                // writes still fault (seen through a write watch query)?
+                let mut old = 0;
+                // SAFETY: inside the allocation.
+                let made = unsafe { VirtualProtect(at.cast(), 1 << 16, PAGE_READONLY, &mut old) };
+                println!("read-only after open: {}", made != 0);
+                // SAFETY: as above.
+                let back = unsafe { VirtualProtect(at.cast(), 1 << 16, PAGE_READWRITE, &mut old) };
+                println!("writable again: {}", back != 0);
+            }
+            drop(heap);
+            card("heap released");
+            // SAFETY: our own allocation.
+            unsafe { VirtualFree(at, 0, MEM_RELEASE) };
+        }
+    }
+
     #[test]
     fn swap_chain_failures_retry_once_per_second_and_success_clears_the_wait() {
         use super::{Duration, Instant, SwapChainRetry};
@@ -1040,6 +1243,8 @@ impl Host {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            #[cfg(feature = "diagnostics")]
+            mem::submission_started(*submitted);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -1056,6 +1261,8 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
+            #[cfg(feature = "diagnostics")]
+            mem::submission_done();
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
@@ -2552,6 +2759,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
+            mem::frame_shown();
         }
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
@@ -3316,6 +3524,175 @@ pub(crate) mod mem {
     ];
     static BYTES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
     static COUNT: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+    /// The submission the GPU runs now (0: none) and when it started, and
+    /// when a frame was last shown, ms on `crate::shadow::clock`.
+    static RUNNING: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static SHOWN: AtomicU64 = AtomicU64::new(0);
+
+    /// Submission `n` goes to the GPU; the stall monitor starts with the
+    /// first.
+    pub(crate) fn submission_started(n: u64) {
+        RUNNING[1].store(crate::shadow::clock(), Relaxed);
+        RUNNING[0].store(n, Relaxed);
+        static MONITOR: std::sync::Once = std::sync::Once::new();
+        MONITOR.call_once(|| {
+            let _ = std::thread::Builder::new().name("victory stall monitor".into()).spawn(monitor);
+        });
+    }
+
+    /// The GPU ran the submission.
+    pub(crate) fn submission_done() {
+        RUNNING[0].store(0, Relaxed);
+    }
+
+    /// A frame was shown.
+    pub(crate) fn frame_shown() {
+        SHOWN.store(crate::shadow::clock(), Relaxed);
+    }
+
+    /// Physical memory available and in all, and the system's commit and
+    /// its limit, in bytes.
+    fn system_memory() -> (u64, u64, u64, u64) {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut s = MEMORYSTATUSEX {
+            dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: a sized structure.
+        unsafe { GlobalMemoryStatusEx(&mut s) };
+        (s.ullAvailPhys, s.ullTotalPhys, s.ullTotalPageFile - s.ullAvailPageFile, s.ullTotalPageFile)
+    }
+
+    /// Our process's page faults so far (soft and hard).
+    fn page_faults() -> u64 {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut c = PROCESS_MEMORY_COUNTERS {
+            cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: our own process and a sized structure.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+        u64::from(c.PageFaultCount)
+    }
+
+    /// The process's committed memory by kind, (committed, resident) bytes
+    /// each: private, mapped (sections: the title's page pools and others),
+    /// image (code). Walks the whole address space: for the monitor thread.
+    pub(crate) fn address_space() -> [(u64, u64); 3] {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        use windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSet;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut out = [(0u64, 0u64); 3];
+        let mut regions: Vec<(usize, usize, usize)> = Vec::new();
+        let mut at = 0usize;
+        loop {
+            let mut m = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: a query into a sized structure.
+            let n = unsafe { VirtualQuery(at as *const core::ffi::c_void, &mut m, size_of::<MEMORY_BASIC_INFORMATION>()) };
+            if n == 0 {
+                break;
+            }
+            let (start, len) = (m.BaseAddress as usize, m.RegionSize);
+            if m.State == MEM_COMMIT {
+                let kind = if m.Type == MEM_PRIVATE {
+                    0
+                } else if m.Type == MEM_MAPPED {
+                    1
+                } else {
+                    2
+                };
+                out[kind].0 += len as u64;
+                regions.push((start, start + len, kind));
+            }
+            let Some(next) = start.checked_add(len) else { break };
+            at = next;
+        }
+        // The working set: a count, then one word per resident page.
+        let mut words: Vec<usize> = vec![0; 1 << 21];
+        loop {
+            // SAFETY: our own process and a buffer of the size given.
+            let ok = unsafe { K32QueryWorkingSet(GetCurrentProcess(), words.as_mut_ptr().cast(), (words.len() * size_of::<usize>()) as u32) };
+            if ok != 0 {
+                break;
+            }
+            let wanted = words[0];
+            if wanted < words.len() {
+                return out;
+            }
+            words = vec![0; wanted + (1 << 16)];
+        }
+        let n = words[0].min(words.len() - 1);
+        let mut pages: Vec<usize> = words[1..=n].iter().map(|w| w & !0xfff).collect();
+        pages.sort_unstable();
+        let mut i = 0;
+        for p in pages {
+            while i < regions.len() && regions[i].1 <= p {
+                i += 1;
+            }
+            if i < regions.len() && regions[i].0 <= p {
+                out[regions[i].2].1 += 4096;
+            }
+        }
+        out
+    }
+
+    /// Once a second: while a submission runs past 3 s, or no frame was
+    /// shown for 3 s, a line on what the GPU, memory and the system do (the
+    /// fps line stops then, and a hung submission logs nothing until done).
+    fn monitor() {
+        let mb = |b: u64| b as f64 / 1048576.0;
+        let mut faults = page_faults();
+        let mut second = 0u64;
+        let mut stalled = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            second += 1;
+            let now = crate::shadow::clock();
+            let new_faults = page_faults();
+            let per_second = new_faults.saturating_sub(faults);
+            faults = new_faults;
+            let running = RUNNING[0].load(Relaxed);
+            let for_ms = now.saturating_sub(RUNNING[1].load(Relaxed));
+            let shown = SHOWN.load(Relaxed);
+            let frame_ms = now.saturating_sub(shown);
+            let stall = (running != 0 && for_ms > 3000) || (shown != 0 && frame_ms > 3000);
+            if second % 30 == 0 || (stall && !stalled) {
+                let started = std::time::Instant::now();
+                let [private, mapped, image] = address_space();
+                tracing::info!(
+                    "address space: private {:.0} MB committed ({:.0} resident), mapped {:.0} MB ({:.0}), image {:.0} MB ({:.0}); walked in {} ms",
+                    mb(private.0),
+                    mb(private.1),
+                    mb(mapped.0),
+                    mb(mapped.1),
+                    mb(image.0),
+                    mb(image.1),
+                    started.elapsed().as_millis()
+                );
+            }
+            stalled = stall;
+            if stall {
+                let (avail, total, commit, limit) = system_memory();
+                let (own_commit, working) = process_memory();
+                let card = super::video_memory().map_or(String::from("unknown"), |(used, budget, other)| {
+                    format!("local {:.0} of {:.0} MB, system {:.0} MB", mb(used), mb(budget), mb(other))
+                });
+                tracing::warn!(
+                    "stalled: submission {running} on the GPU for {for_ms} ms (0: none), last frame {frame_ms} ms ago; \
+                     RAM available {:.0} of {:.0} MB, system commit {:.0} of {:.0} MB; process commit {:.0} MB, working set {:.0} MB, \
+                     {per_second} page faults/s; card {card}",
+                    mb(avail),
+                    mb(total),
+                    mb(commit),
+                    mb(limit),
+                    mb(own_commit),
+                    mb(working)
+                );
+            }
+        }
+    }
     /// Of those, freed since (kinds whose owners report it: title memory
     /// copies).
     static FREED_BYTES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
@@ -3369,20 +3746,38 @@ pub(crate) mod mem {
         let (exact, exact_bytes) = crate::shadow::views_live();
         let (pool, pooled) = crate::shadow::pool_held();
         let (evicted, evicted_bytes) = crate::shadow::evicted();
+        let (superseded, superseded_bytes) = crate::shadow::superseded();
         let (commit, working) = process_memory();
+        let (avail, total, system_commit, limit) = system_memory();
         tracing::info!(
-            "host memory live: buffer copies {:.0} MB ({nw}), loose windows {:.0} MB ({nl}; lookups asked for {:.0} MB of their pages; {evicted} given up, {:.0} MB), \
+            "system memory: RAM available {:.0} of {:.0} MB, commit {:.0} of a {:.0} MB limit",
+            mb(avail),
+            mb(total),
+            mb(system_commit),
+            mb(limit)
+        );
+        tracing::info!(
+            "host memory live: buffer copies {:.0} MB ({nw}), loose windows {:.0} MB ({nl}; lookups asked for {:.0} MB of their pages; {evicted} given up, {:.0} MB; {superseded} superseded, {:.0} MB), \
              view copies {:.0} MB ({nv}; {exact} found, {:.0} MB); snapshot pool {:.0} MB ({pooled}); process commit {:.0} MB, working set {:.0} MB",
             mb(whole),
             mb(windows),
             mb(asked),
             mb(evicted_bytes),
+            mb(superseded_bytes),
             mb(views),
             mb(exact_bytes),
             mb(pool),
             mb(commit),
             mb(working)
         );
+        {
+            static LAST: AtomicU64 = AtomicU64::new(0);
+            let now = crate::shadow::clock();
+            if now >= LAST.load(Relaxed) + 30_000 {
+                LAST.store(now, Relaxed);
+                tracing::info!("title memory under host copies: {}", crate::shadow::backing());
+            }
+        }
         let (census, (gone, gone_bytes), (targets, spans, distinct)) = crate::resource::census();
         let part = |i: usize| format!("{} {:.0} MB", census[i].0, mb(census[i].1));
         let card = super::video_memory().map_or(String::from("unknown"), |(used, budget, other)| {
