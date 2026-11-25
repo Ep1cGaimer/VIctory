@@ -153,7 +153,7 @@ fn seen(view: &View) -> Option<Seen> {
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     if let View::Shader(resource, _) = view
-        && let Some(texture) = crate::resource::host_resource(*resource as This)
+        && let Some(ref texture) = crate::resource::host_resource(*resource as This)
     {
         return crate::texture::title_written(texture).then_some(Seen::Texture(*resource));
     }
@@ -210,7 +210,7 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
             if !done.insert(r) {
                 continue;
             }
-            let Some(texture) = crate::resource::host_resource(r as This) else {
+            let Some(ref texture) = crate::resource::host_resource(r as This) else {
                 continue;
             };
             if crate::texture::upload_changed(list, r as This, texture) {

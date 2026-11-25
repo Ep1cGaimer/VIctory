@@ -286,7 +286,7 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         // Each plane's first resource with its host texture and the part
         // of it shown; the host states are left as they were.
-        let mut shown: Vec<(This, crate::compose::Shown<'_>)> = Vec::new();
+        let mut found: Vec<(This, windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, Option<[u32; 4]>)> = Vec::new();
         for k in 0..(planes as usize).min(crate::compose::PLANES) {
             // SAFETY: the title passes `planes` descriptions, PLANE_STRIDE
             // bytes apart.
@@ -309,8 +309,10 @@ extern "system" fn present(
             });
             let state = crate::resource::host_transition(resource, COPY_SOURCE)
                 .map_or(COPY_SOURCE, |(_, before)| before);
-            shown.push((resource, crate::compose::Shown { texture, state, rect }));
+            found.push((resource, texture, state, rect));
         }
+        let shown: Vec<(This, crate::compose::Shown<'_>)> =
+            found.iter().map(|(r, texture, state, rect)| (*r, crate::compose::Shown { texture, state: *state, rect: *rect })).collect();
         #[cfg(feature = "diagnostics")]
         if shown.len() > 1 {
             static SEEN: AtomicBool = AtomicBool::new(false);

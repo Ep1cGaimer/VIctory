@@ -326,7 +326,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
                 second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                last: u64::from(crate::host::legal_state(&texture, wanted)),
             })
         }
         1 => Some(Barrier {
@@ -405,7 +405,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    if let Some((texture, before)) = list.transition(resource, state) {
+    if let Some((ref texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
@@ -457,7 +457,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
-        if let (Some(to), Some(from)) = (
+        if let (Some(ref to), Some(ref from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
@@ -606,7 +606,7 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
-        let Some(to) = crate::resource::host_resource(dst.resource) else {
+        let Some(ref to) = crate::resource::host_resource(dst.resource) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
@@ -634,7 +634,7 @@ extern "system" fn copy_texture_region(
             }
             _upload = buffer;
         } else {
-            let Some(texture) = crate::resource::host_resource(src.resource) else {
+            let Some(ref texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
             if crate::resource::skip_mixed_packed_copy("CopyTextureRegion", to, texture)
@@ -649,7 +649,7 @@ extern "system" fn copy_texture_region(
             from.resource = texture.as_raw().cast_const().cast();
             #[cfg(feature = "diagnostics")]
             {
-                source = Some(texture);
+                source = Some(texture.clone());
             }
         }
         ensure_state(list, dst.resource, COPY_DEST);
@@ -735,7 +735,7 @@ extern "system" fn resolve(
 ) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
-        && let (Some(to), Some(from)) = (
+        && let (Some(ref to), Some(ref from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         )
@@ -817,7 +817,7 @@ extern "system" fn clear_rtv(
         else {
             return;
         };
-        let (Some(texture), Some(host)) = (
+        let (Some(ref texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
         ) else {
@@ -868,7 +868,7 @@ extern "system" fn clear_dsv(
         else {
             return;
         };
-        let (Some(texture), Some(host)) = (
+        let (Some(ref texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
         ) else {

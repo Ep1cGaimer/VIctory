@@ -1544,7 +1544,7 @@ impl HostList {
         &self,
         resource: crate::object::This,
         wanted: u32,
-    ) -> Option<(&'static ID3D12Resource, u32)> {
+    ) -> Option<(ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
         if let Some(Some(twin)) = copy.twin.get()
@@ -1552,7 +1552,7 @@ impl HostList {
         {
             return None;
         }
-        let wanted = legal_state(texture, wanted);
+        let wanted = legal_state(&texture, wanted);
         self.track(&copy, wanted).map(|before| (texture, before))
     }
 
@@ -2558,6 +2558,7 @@ impl Meter {
             return;
         }
         crate::memory::evict_loose();
+        crate::resource::let_go_idle();
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
@@ -2952,6 +2953,25 @@ static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
 /// views.
 pub(crate) fn retire(resource: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+}
+
+/// The card's local memory in use and its budget, and the system memory it
+/// uses, in bytes.
+pub(crate) fn video_memory() -> Option<(u64, u64, u64)> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
+        DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3, IDXGIFactory4,
+    };
+    let host = host()?;
+    // SAFETY: queries of this live device's adapter into local structures.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(host.device.GetAdapterLuid()).ok()?;
+        let (mut local, mut other) = (DXGI_QUERY_VIDEO_MEMORY_INFO::default(), DXGI_QUERY_VIDEO_MEMORY_INFO::default());
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut other).ok()?;
+        Some((local.CurrentUsage, local.Budget, other.CurrentUsage))
+    }
 }
 
 /// After a submission has run, with none running: the retired resources go.
@@ -3362,6 +3382,21 @@ pub(crate) mod mem {
             mb(pool),
             mb(commit),
             mb(working)
+        );
+        let (census, (gone, gone_bytes)) = crate::resource::census();
+        let part = |i: usize| format!("{} {:.0} MB", census[i].0, mb(census[i].1));
+        let card = super::video_memory().map_or(String::from("unknown"), |(used, budget, other)| {
+            format!("local {:.0} MB of a {:.0} MB budget, system {:.0} MB", mb(used), mb(budget), mb(other))
+        });
+        tracing::info!(
+            "host textures by holder: targets {}, host-written {}, lists {}, slots only {}, free and lately used {}, free and idle {}; let go {gone} ({:.0} MB); card memory {card}",
+            part(0),
+            part(1),
+            part(2),
+            part(3),
+            part(4),
+            part(5),
+            mb(gone_bytes)
         );
     }
 }

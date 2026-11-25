@@ -105,7 +105,7 @@ pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
-    let (Some(a), Some(b), Some(host)) = (
+    let (Some(ref a), Some(ref b), Some(host)) = (
         crate::resource::host_resource(from),
         crate::resource::host_resource(to),
         host(),
@@ -298,6 +298,11 @@ impl Staging {
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
         changed
+    }
+
+    /// The upload buffer itself.
+    pub(crate) fn buffer(&self) -> &ID3D12Resource {
+        &self.buffer
     }
 
     /// Returns the bytes of title memory read, and whether it detiled.

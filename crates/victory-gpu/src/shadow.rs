@@ -942,7 +942,7 @@ const KIND_LOOSE: usize = 1;
 const KIND_VIEW: usize = 2;
 
 /// Milliseconds since the first call.
-fn clock() -> u64 {
+pub(crate) fn clock() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
