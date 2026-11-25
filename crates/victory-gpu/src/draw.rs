@@ -1310,10 +1310,37 @@ impl State {
                     View::Constant(address, size) => Some((address, u64::from(size))),
                     ref v => crate::descriptor::host::buffer_range(v),
                 };
-                let Some((at, len)) = range.filter(|r| r.1 <= 64) else {
+                // `VICTORY_PROBE_SMALL`: a larger cap in bytes; such buffers
+                // log their first dwords and those at 280, in title memory
+                // and in the copy.
+                static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let cap = *CAP.get_or_init(|| {
+                    std::env::var("VICTORY_PROBE_SMALL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64)
+                });
+                let Some((at, len)) = range.filter(|r| r.1 <= cap) else {
                     continue;
                 };
                 let Some(shadow) = crate::shadow::find(at, len) else { continue };
+                if len > 64 {
+                    let who = format!("{} {:?} s{}+{} {at:#x}+{len}", stage.shader.hash, u.kind, u.slot, u.table_offset_dwords);
+                    let title = |a: u64| {
+                        let mut b = [0u8; 32];
+                        crate::host::read_into(a as *const u8, &mut b).then(|| {
+                            b.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<_>>()
+                        })
+                    };
+                    let (t0, t280) = (title(at), title(at + 280));
+                    let s = shadow.clone();
+                    list.defer_host(move || {
+                        tracing::info!(
+                            target: "victory_gpu::trace",
+                            "probe {who}: title at recording {t0:x?} @280 {t280:x?}; copy at submission {} @280 {}",
+                            s.peek_words(at, 32),
+                            s.peek_words(at + 280, 32)
+                        )
+                    });
+                    continue;
+                }
                 let who = format!("{} {:?} s{}+{} {at:#x}+{len}", stage.shader.hash, u.kind, u.slot, u.table_offset_dwords);
                 let (s, w) = (shadow.clone(), who.clone());
                 list.defer_host(move || tracing::info!(target: "victory_gpu::trace", "small {w} at submission: {}", s.peek(at, len)));
@@ -1594,6 +1621,21 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
             list.note_op(|| format!("DROPPED indirect kind {kind} (skipped) {}", crate::pipeline::shaders_of(self.pipeline as This)));
+            // A listed frame: the arguments it would have run, in the host
+            // copy after the list (what earlier passes of it wrote there).
+            if crate::capture::dump_on()
+                && crate::capture::listed(crate::queue::presented() + 1)
+                && let Some(args) = crate::shadow::find(arguments, u64::from(stride) * u64::from(max.max(1)))
+            {
+                let name = crate::pipeline::shaders_of(self.pipeline as This);
+                list.defer_after(move || {
+                    tracing::info!(
+                        target: "victory_gpu::trace",
+                        "skipped indirect kind {kind} max {max} count {count:?} {name}: arguments after the list {}",
+                        args.peek_words(arguments, u64::from(stride).min(64))
+                    )
+                });
+            }
             return false;
         }
         const DRAW: u32 = 0;

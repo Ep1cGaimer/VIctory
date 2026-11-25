@@ -26,6 +26,32 @@ pub const MEMORY_SPACE: u32 = 2;
 /// indices").
 pub const HEAP_VIEWS: u32 = 1 << 21;
 pub const HEAP_SAMPLERS: u32 = 2048;
+
+/// The view heap translations clamp to ([`heap_views`]).
+static VIEW_SLOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(HEAP_VIEWS);
+
+/// The view heap size translated shaders assume: [`HEAP_VIEWS`], or what
+/// [`set_heap_views`] made it. Heap indices are clamped below it and the
+/// null buffer views sit at its top ([`null_buffer_view`]). A host whose
+/// shader-visible heaps stop short of [`HEAP_VIEWS`] (NVIDIA: 1,000,000)
+/// sets its own size before translating; past its heap an index is
+/// undefined (on the RTX 4060, DEVICE_HUNG). Part of the translation: a
+/// shader cache keys on it.
+pub fn heap_views() -> u32 {
+    VIEW_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets [`heap_views`] (at least 4: the clamp slot and the null views
+/// take the top three), before anything is translated.
+pub fn set_heap_views(slots: u32) {
+    VIEW_SLOTS.store(slots.clamp(4, HEAP_VIEWS), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The heap index of the host's null raw buffer SRV under [`heap_views`]
+/// (the null raw UAV just below it); [`NULL_BUFFER_VIEW`] by default.
+pub fn null_buffer_view() -> u32 {
+    heap_views() - 2
+}
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
@@ -529,7 +555,7 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { heap_views() } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));

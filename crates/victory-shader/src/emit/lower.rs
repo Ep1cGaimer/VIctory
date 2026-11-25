@@ -4603,6 +4603,11 @@ impl<'a> Lower<'a> {
             let val = if word < 2 {
                 let index = self.heap_index(site, k as u8, false)?;
                 let c = self.cur;
+                // Root buffers have no bounds check: an index past the host's
+                // heap reads its last entry, as the heap accesses do.
+                let last = self.s.m.i32(super::heap_views() - 1);
+                let over = self.s.m.cmp(c, pred::IUGT, index, last);
+                let index = self.s.m.select(c, over, last, index);
                 let three = self.s.m.i32(3);
                 let at = self.s.m.bin(c, Bin::Shl, index, three);
                 let w = self.s.m.i32(4 * word);
@@ -5145,7 +5150,7 @@ impl<'a> Lower<'a> {
             return index;
         }
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let last = self.s.m.i32(super::heap_views() - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
@@ -5158,7 +5163,7 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        let null = super::null_buffer_view() - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
     }
