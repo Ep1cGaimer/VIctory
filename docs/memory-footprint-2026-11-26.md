@@ -152,8 +152,23 @@ The old `host::mem` counters were cumulative ("made"). The new "host memory live
   - Runs R to W were spent tracing why demotion did not help. The remaining reads were all on the marked-view path, from title slots made before the demotion. Those slots keep only the copy's buffer, so a check on the copy itself missed them.
   - In run X, copy-backs read video memory almost never: 0–5 pages per 15 s, against about 50 a frame before.
 - **Still not good enough:** at the peak, RAM available still falls to 400–800 MB, and commit grows to 44 of 46 GB as the pagefile grows. The loading screen runs at 29–30 fps, then 0.5–1.5 fps during the load itself. No 5-minute run reached the world.
+- **Long runs (2026-11-26, after 6edc329):**
+
+  | Run | Settings | Length | Crash | Stalls | RAM available (min / median) | Peak commit | Card system memory (median) |
+  |---|---|---|---|---|---|---|---|
+  | L (earlier build) | 4 MiB windows, system memory | 10 min | watchdog | many | near 0 | | 3.9 GB |
+  | Y | the settings above, set by hand | 12 min | none | 17, 110 s | 15 / 897 MB | 46.2 GB | 2.25 GB |
+  | Z | defaults only (`VICTORY_SHADER_LOOP_LIMIT=256`) | 10 min | none | 25, 215 s | 17 / 958 MB | 49.6 GB | 2.14 GB |
+
+  - Both reached the world, at 1,000–6,000 draws a frame. A steady frame takes 600–700 ms: 270–370 ms preparing (copies 70–160 ms, heaps 40 ms) and about 275 ms on the GPU. Copying back is 15–25 ms.
+  - Hard faults are 27–222 a frame in steady play, so paging costs in episodes (the stalls, up to 8 s frames), not every frame.
+  - Making a copy again in system memory reads the video-memory copy at 22 MB/s: 53 of them in run Z, with frames of up to 500 ms copying back when it happens. A GPU copy would avoid that.
+- **Why RAM did not get freer:** the median available RAM is about the same with copies in system memory (K–P: 600–1,050 MB) as in video memory (R–Z: 750–1,040 MB). Locked memory let go goes to the title's paged-out pages, which are resident again. Process commit is 11.5 GB at boot (the title's own) and 19–23 GB in the world; mapped title memory is 10–20 GB committed but under 2.5 GB resident.
+- **Why more copies cannot move to video memory now:** video memory is full at 6.65 of 7.19 GB, within the 512 MiB margin. Of it, 4,270 MB is 1,191 render targets lying over 4,047 MB of title memory (3,885 MB distinct). That is console-sized data, so widened formats and aliasing would save under 5 %. Only a lower render resolution would free a lot of it.
+- **Commit headroom:** the pagefile is 20–40 GB (custom, not system-managed), so the commit limit can reach about 55.6 GB against a 49.6 GB peak. Without the game, 10.9 GB of RAM is free.
 - **Next for RAM:**
-  - About 1.18 GB of whole buffer copies (3,460), most of them made with unordered access. For those, keep the copy in video memory and read back only on demand, with a GPU copy to a readback buffer instead of CPU reads.
+  - About 1.18 GB of whole buffer copies (3,460), most of them made with unordered access. Moving them to video memory needs room there first (see above).
+  - When a copy is made again in system memory, use a GPU copy instead of reading video memory from the CPU.
   - View copies.
   - Use tracking from the GPU side, so that windows that are idle but still held by a page table can be let go.
 
