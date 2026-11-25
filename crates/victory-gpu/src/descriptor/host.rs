@@ -640,9 +640,13 @@ impl HostHeap {
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
+            // host heap seen so far, once per 65,536 slots. (A line per new
+            // highest slot was one per slot as the title walks its heap at
+            // boot: 280,000 lines in 32 s, until the title's own watchdog
+            // ended the process.)
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            let step = index >> 16;
+            if HIGHEST.fetch_max(step, std::sync::atomic::Ordering::Relaxed) < step {
                 tracing::warn!(
                     index,
                     count = self.count,

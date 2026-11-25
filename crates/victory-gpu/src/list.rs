@@ -461,7 +461,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if crate::resource::skip_mixed_packed_copy("CopyResource", to, from) {
+            if crate::resource::skip_mixed_packed_copy("CopyResource", to, from)
+                || crate::resource::skip_plane_copy("CopyResource", to, from)
+            {
                 return;
             }
             if crate::texture::title_written(from) {
@@ -613,6 +615,8 @@ extern "system" fn copy_texture_region(
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
+        #[cfg(feature = "diagnostics")]
+        let mut source = None;
         if src.kind == FOOTPRINT {
             // SAFETY: to is the live host resource of this destination.
             let format = unsafe { to.GetDesc() }.Format.0 as u32;
@@ -633,7 +637,9 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
-            if crate::resource::skip_mixed_packed_copy("CopyTextureRegion", to, texture) {
+            if crate::resource::skip_mixed_packed_copy("CopyTextureRegion", to, texture)
+                || crate::resource::skip_plane_copy("CopyTextureRegion", to, texture)
+            {
                 return;
             }
             if crate::texture::title_written(texture) {
@@ -641,6 +647,10 @@ extern "system" fn copy_texture_region(
             }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
+            #[cfg(feature = "diagnostics")]
+            {
+                source = Some(texture);
+            }
         }
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
@@ -664,6 +674,19 @@ extern "system" fn copy_texture_region(
                     (src.kind == FOOTPRINT).then_some(src.footprint)
                 )
             };
+            // Every copy as it is recorded (`victory_gpu::copytrace=trace`):
+            // the last line before a driver fault in the call names it.
+            if tracing::enabled!(target: "victory_gpu::copytrace", tracing::Level::TRACE) {
+                // SAFETY: live host resources (the source when a texture).
+                let (td, fd) = unsafe { (to.GetDesc(), source.map(|t| t.GetDesc())) };
+                tracing::trace!(
+                    target: "victory_gpu::copytrace",
+                    to = format_args!("{:?} {}x{}x{} m{} f{} flags {:#x} layout {}", td.Dimension, td.Width, td.Height, td.DepthOrArraySize, td.MipLevels, td.Format.0, td.Flags.0, td.Layout.0),
+                    from = format_args!("{:?}", fd.map(|d| (d.Dimension, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0, d.Flags.0, d.Layout.0))),
+                    "{}",
+                    text()
+                );
+            }
             match read {
                 Some(range) => list.note_read(text, range),
                 None => list.note_op(text),

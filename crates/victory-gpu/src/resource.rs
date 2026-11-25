@@ -401,6 +401,41 @@ pub(crate) fn expand_packed16_rows(
 /// once per packed format so callers can skip the command before recording
 /// barriers or marking the destination written.
 #[cfg(windows)]
+/// Host formats of textures with a depth and a stencil plane.
+const DEPTH_STENCIL: [u32; 4] = [19, 20, 44, 45];
+
+/// Whether a GPU copy between `to` and `from` is skipped (`op` names it
+/// in the warning, given once): one has a depth and a stencil plane and the
+/// other does not, as when the title copies the depth of a depth-stencil
+/// texture into a depth texture. The host copies whole textures of
+/// different formats there, which NVIDIA's driver does not survive (the
+/// device was removed at once; with a trace, the crash was in the copy).
+/// shortcut: the depth is not copied; copy its plane through a shader if a
+/// title reads the copy.
+#[cfg(windows)]
+pub(crate) fn skip_plane_copy(
+    op: &str,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    // SAFETY: live host resources.
+    let (to_fmt, from_fmt) =
+        unsafe { (to.GetDesc().Format.0 as u32, from.GetDesc().Format.0 as u32) };
+    let skip = plane_mismatch(to_fmt, from_fmt);
+    if skip {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(op, to_format = to_fmt, from_format = from_fmt, "skipping GPU copy between a depth-stencil texture and one with fewer planes");
+        });
+    }
+    skip
+}
+
+/// Formats `to` and `from` differ in whether they have a stencil plane.
+fn plane_mismatch(to: u32, from: u32) -> bool {
+    to != from && DEPTH_STENCIL.contains(&to) != DEPTH_STENCIL.contains(&from)
+}
+
 pub(crate) fn skip_mixed_packed_copy(
     op: &str,
     to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -2074,6 +2109,20 @@ pub(crate) fn test_buffer(width: u64) -> This {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Copies between a depth-stencil texture and a depth (or other)
+    /// texture are told apart from same-format and colour copies.
+    #[test]
+    fn depth_stencil_to_depth_copies_are_plane_mismatches() {
+        // R32G8X24_TYPELESS to R32_TYPELESS: the copy that removed the device.
+        assert!(plane_mismatch(39, 19));
+        assert!(plane_mismatch(19, 41));
+        assert!(plane_mismatch(44, 39));
+        assert!(!plane_mismatch(19, 19));
+        assert!(!plane_mismatch(19, 20));
+        // Colour reinterpretations (BC1 from R32G32_UINT) are not.
+        assert!(!plane_mismatch(71, 17));
+    }
     use crate::object::slot;
 
     #[test]
