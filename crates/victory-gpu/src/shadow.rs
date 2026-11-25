@@ -104,10 +104,11 @@ fn give_back(v: Vec<u8>) {
     });
 }
 
-/// Snapshot memory kept for reuse (`VICTORY_SNAPSHOT_POOL_MB`, 2048).
+/// Snapshot memory kept for reuse (`VICTORY_SNAPSHOT_POOL_MB`, 512: what
+/// it holds is locked system memory, which the title's pages page out for).
 fn pool_bytes() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| (crate::switch::number("VICTORY_SNAPSHOT_POOL_MB", 2048) as usize) << 20)
+    *MOST.get_or_init(|| (crate::switch::number("VICTORY_SNAPSHOT_POOL_MB", 512) as usize) << 20)
 }
 
 /// Bytes the snapshot pool holds now, and how many buffers (diagnostics).
@@ -1134,11 +1135,12 @@ fn find_in(address: u64, len: u64, tail: bool, writes: bool) -> Option<Arc<Shado
 const WINDOW: u64 = 4 << 20;
 
 /// The window loose memory is copied in (`VICTORY_LOOSE_WINDOW_KB`, a power
-/// of two from 64 to 4096; 4096 by default, [`WINDOW`]).
+/// of two from 64 to 4096 ([`WINDOW`]); 64 by default: 4 MiB windows held
+/// ~2.7 GB of locked system memory while loading, 64 KiB ones 1.0-1.5 GB).
 fn window() -> u64 {
     static W: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *W.get_or_init(|| {
-        let kb = crate::switch::number("VICTORY_LOOSE_WINDOW_KB", WINDOW >> 10);
+        let kb = crate::switch::number("VICTORY_LOOSE_WINDOW_KB", 64);
         if kb.is_power_of_two() && (64..=WINDOW >> 10).contains(&kb) { kb << 10 } else { WINDOW }
     })
 }
@@ -1214,7 +1216,7 @@ pub(crate) fn superseded() -> (u64, u64) {
 
 /// Gives up loose windows no lookup found for `VICTORY_LOOSE_IDLE_S`
 /// seconds, then the least recently found while they hold more than
-/// `VICTORY_LOOSE_CAP_MB` (both 0, off, by default). Only windows nothing
+/// `VICTORY_LOOSE_CAP_MB` (20 s and 0, off, by default). Only windows nothing
 /// else holds go: no heap slot's view, no list, no shader writes not yet
 /// copied back (`held`: how many of a copy's holders are page tables,
 /// which a window leaving lets go of at their next rewrite, [`changed`]).
@@ -1227,7 +1229,7 @@ pub(crate) fn evict_loose(held: impl Fn(usize) -> usize) {
     use std::sync::atomic::Ordering::Relaxed;
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     let &(idle, cap) = LIMITS.get_or_init(|| {
-        (crate::switch::number("VICTORY_LOOSE_IDLE_S", 0) * 1000, crate::switch::number("VICTORY_LOOSE_CAP_MB", 0) << 20)
+        (crate::switch::number("VICTORY_LOOSE_IDLE_S", 20) * 1000, crate::switch::number("VICTORY_LOOSE_CAP_MB", 0) << 20)
     });
     let now = clock();
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());

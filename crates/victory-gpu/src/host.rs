@@ -3164,12 +3164,12 @@ impl Host {
     /// of title memory shaders only read (loose windows, buffers made
     /// without unordered access): system memory they would pin is what the
     /// title's own pages page out for. `VICTORY_COPIES_IN_VIDEO`
-    /// (0, off, by default); None where the card has no such heap or video
+    /// (1, on, by default; 0 turns it off); None where the card has no such heap or video
     /// memory would come within 512 MiB of its budget.
     pub(crate) fn video_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let on = *ON.get_or_init(|| {
-            if crate::switch::number("VICTORY_COPIES_IN_VIDEO", 0) == 0 {
+            if crate::switch::number("VICTORY_COPIES_IN_VIDEO", 1) == 0 {
                 return false;
             }
             let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
