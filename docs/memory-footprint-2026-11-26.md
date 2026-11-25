@@ -36,4 +36,38 @@ GPU-visible title buffers the title declares are only ~1 GB (3,398 buffers; 286 
 - How much of the page pool the title has actually touched (resident) in the world, so the cost of pinning it is known.
 - fxceless's `VICTORY_INPLACE=2` (title buffers in place, private memory only) on this laptop: commit and frame time against `fxceless-1`.
 
-A prompt for a second researcher is in the session scratchpad (`prompt-memory-footprint.md`); merge its answers here.
+
+## Second researcher's answer, checked against the code (2026-11-26)
+A second agent answered the prompt. Its claims, checked against `victory-world-30fps-v2`:
+
+**Confirmed**
+- `shadow.rs:89` `POOL_BYTES = 2 << 30`: up to 2 GiB of CPU snapshot `Vec`s are kept for reuse. They are not counted by `host::mem`, so they are commit on top of the 5–6 GB shared copies. The pool exists because fresh buffers cost a page fault per 4 KiB, so shrink it and measure rather than remove it.
+- `shadow.rs:885` `WINDOW = 4 << 20`, and `LOOSE` holds every window forever (a `shortcut:` note says so). Smaller windows plus fence-retired eviction is the quick win.
+- `texture.rs:512`: every texture keeps its own upload buffer (`Staging`) and a CPU `Last::read` for as long as it lives. Upload heaps total about 0.25 GB, so a pooled upload ring saves little RAM but is the right shape.
+- `resource.rs:1897` `PLACED_TEXTURES`: one host texture per address and description, never released (a `shortcut:` note says so). This must be fixed for a texture budget to work.
+- `EXACT` (view copies): one copy per (address, length) of a structured view that doesn't start on an element of its buffer's copy (`for_view`). Ring positions change every frame, so copies are made by the hundred. The suggested fix, keying copies by (stride, address mod stride) over the whole parent range, is sound. A buffer placed at m × 64 KiB in one heap covers phases that are multiples of gcd(64 KiB, stride); for stride 12 that is m = 0, 1, 2.
+- There are no title `VirtualProtect`/`VirtualFree` hooks (`kernel.rs`). In-place memory needs them, because those calls fail with error 87 under an opened heap.
+
+**Corrected**
+- *"`HostHeap::kept` leaks view copies"*: no. `descriptor/host.rs:587` `keep()` replaces the slot and retires the old resource on overwrite. A copy lives while a slot still shows it, which is required. Slots the title never rewrites do hold copies, so ageing out slots not seen for N frames is a possible refinement, not a leak fix.
+- *"20 ms per 64 MB is sysmem vs VRAM"*: the probe compared copying out of an opened heap with copying out of today's shared copies. Both are system RAM, so in place is no slower than today. VRAM mirrors for hot buffers are an extra gain, not a requirement.
+- Its source for `inplace.rs` is given as `ztrx/main`; I read it in fxceless's fork. Check where it is merged before porting any code from it (no unmerged PRs).
+
+**Agreed with, still unmeasured**
+- `Evict` on an opened heap may not unpin pages on NVIDIA. Destroying the heap does.
+- Lazy 64–128 MiB `SEC_COMMIT` slabs for the page pool, so one heap per slab replaces 61k single-page views and aliasing stays free. Commit is charged only for touched slabs.
+- Destroying and re-detiling cold sampled textures, rather than `Evict`: `Evict` moves the bytes into system RAM, which is the scarce thing here.
+- A stable 30 fps is not reachable on this laptop from memory work alone. Once paging stops, the GPU time (432 ms a frame in `v2-l256-timing`, with 138 wave64 pipelines refused) is the wall. A realistic target is 5–10 fps after the memory work, and more only with the wave64 and GPU work.
+
+## Combined plan
+1. **Quick wins, about 3–5 GB.**
+   - `LOOSE`: 1 MiB windows, each with a last-use frame and fence; retire after the fence with a byte cap (clear its page-table and descriptor users first; check `memory.rs`).
+   - `POOL_BYTES`: 2 GiB → 256–512 MiB.
+   - `EXACT`: copies keyed by (stride, phase) over the parent range instead of per ring position.
+   - Measure with one short world run, using the `host::mem` lines and commit/working set.
+2. **Texture budget, about 1.5–2 GB of VRAM and spill.** A `QueryVideoMemoryInfo` budget; an LRU that destroys cold sampled textures and re-detiles them from title memory; `PLACED_TEXTURES` and per-texture staging made releasable.
+3. **Census, then in place.**
+   - Log the distinct pool pages committed and the backing of the loose windows in the world (private or view).
+   - Probe `Evict` and `SEC_COMMIT` slab pinning on the RTX.
+   - Then: in-place private memory (`OpenExistingHeapFromAddress1` on 2–4 MiB chunks, with `VirtualProtect`/`VirtualFree` hooks), and in-place page pool (lazy `SEC_COMMIT` slabs plus `OpenExistingHeapFromFileMapping`).
+4. **VRAM mirrors** for hot, read-mostly buffers within a budget.
