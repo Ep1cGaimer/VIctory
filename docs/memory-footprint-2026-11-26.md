@@ -71,3 +71,31 @@ A second agent answered the prompt. Its claims, checked against `victory-world-3
    - Probe `Evict` and `SEC_COMMIT` slab pinning on the RTX.
    - Then: in-place private memory (`OpenExistingHeapFromAddress1` on 2–4 MiB chunks, with `VirtualProtect`/`VirtualFree` hooks), and in-place page pool (lazy `SEC_COMMIT` slabs plus `OpenExistingHeapFromFileMapping`).
 4. **VRAM mirrors** for hot, read-mostly buffers within a budget.
+
+## Measured (2026-11-26, `mem-A-default` / `mem-B-evict`, build 79527fc, 6 min each, both still on loading screens)
+The old `host::mem` counters were cumulative ("made"). The new "host memory live" line gives:
+
+| | A: defaults | B: 1 MiB windows, idle 20 s, cap 1 GB, pool 512 MB |
+|---|---|---|
+| Loose windows live | 4,268 MB (976); lookups asked for 1,622 MB of their pages | 1,964 MB (1,481); asked for 837 MB; 2,847 given up (4.3 GB) |
+| Whole-buffer copies | 1,180 MB | 1,189 MB |
+| View copies live | ~300 MB (made: much more; most die with their slots) | ~300 MB |
+| Snapshot pool | 0 MB at the sample | 0 MB |
+| Process commit | 21.8 GB | 19.5 GB |
+| Working set | 2.6 GB | 3.6 GB |
+| ms/frame (last samples) | 3,700–5,100 (GPU 2,812) | 1,800–3,400 (GPU 1,452) |
+
+- Captured frames match between A and B (loading-screen art, a fade in B at frame 2100), and no device removal. B reached frame 2100 in the time A reached 1800.
+- Not yet checked: world frames with eviction on. Shaders reading through the page table at computed addresses see an evicted window as missing until a lookup asks for it again.
+- So: view copies (0.3 GB) and the snapshot pool (0) are not where the memory is. Loose windows are, and the switches already cut 2.3 GB of them.
+- What remains in the 19.5 GB is mostly the title's own memory plus about 3.5 GB of copies; textures sit in VRAM and spill. Zero-copy can remove the copies, but the title's memory stays.
+
+## More references (from the user's research agents, 2026-11-26; checked only where noted)
+- **fxceless's fork (its pushed main, GPL-3.0; reviewed in part):** `resource.rs` `room()` and `let_go_idle()`, a texture budget from `QueryVideoMemoryInfo` with a 2 GiB floor, at 90 % of budget. It sweeps idle textures the title fills and the host never wrote, if no list or slot holds them. Also `texture.rs` `let_go_idle` for staging, `HostHeap::texture_slot_gone`, a snapshot pool capped at 512 MiB, `VICTORY_WINDOW_KB`/`VICTORY_WINDOW_TAILS`, and card buffers. Reported to carry an RTX 3050 8 GB for 90 minutes at 1–3 fps with a large pagefile.
+- **XCL (GPL-2.0-only; ideas only, see below):** a self-sizing coherent heap with its size remembered between runs (`cache/uma_coherent.txt`), sparse VRAM windows through `UpdateTileMappings`, and batched write-watch.
+- **Xenia (BSD-3):** `d3d12_tiled_shared_memory`, a reserved buffer mapped in 64 KiB tiles on touch, and a soft/hard texture cache limit.
+- **Microsoft D3DX12Residency (MIT):** an LRU residency manager on `QueryVideoMemoryInfo`.
+- **Yuzu (GPL-3.0+):** a texture/buffer garbage collector with `expected_memory` / `critical_memory` watermarks.
+- **shadPS4:** image GC on a memory budget, and falling back to host-visible memory instead of failing with out-of-memory.
+- **VKD3D-Proton 2.13:** no ReBAR upload heaps on GPUs with 8 GB or less.
+- **Licence note:** the user allows code from GPL-2.0 repositories, but GPL-2.0-*only* code cannot legally be combined into this GPL-3.0-or-later project. GPL-2.0-*or-later* code can. Check each file's licence header.
