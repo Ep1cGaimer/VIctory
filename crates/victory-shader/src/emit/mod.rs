@@ -77,9 +77,9 @@
 //!   console's in lanes (`[numthreads]` in the DXIL), the vertex and
 //!   primitive maxima its own, triangles only, no wave size required. The
 //!   console numbers groups in x only: the draw path passes the title's
-//!   count as `DispatchMesh(x, 1, 1)`. Per-primitive outputs (`PSG1`) are
-//!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
-//!   console never exports them).
+//!   count as `DispatchMesh(x, 1, 1)`. The host's `SV_CullPrimitive`
+//!   comes from the console's packed primitive export when it fits in the
+//!   output budget. Other shaders cull with degenerate triangles.
 
 mod bitcode;
 mod container;
@@ -299,9 +299,9 @@ pub fn emit(
             e.interp = 5;
         }
     }
-    // Per-primitive outputs are constant. The console never exports a
-    // primitive id or cull flag a mesh shader writes (it culls with the
-    // primitive export), so those rows are left out.
+    // Per-primitive outputs are constant. The console's signature may
+    // name a primitive ID or cull flag without allocating a parameter for
+    // it. The lowerer supplies the host cull flag from the primitive export.
     let mut prims = sig(FourCC::PSG1)?;
     prims.retain(|e| !matches!(e.kind, 10 | 30));
     for e in &mut prims {
@@ -694,6 +694,85 @@ mod tests {
         let ours = c[4..20].to_vec();
         v.validate(&mut c).unwrap();
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
+    }
+
+    /// A native cull declaration becomes the host's synthetic output,
+    /// including when the declared maxima exceed its emitting lanes.
+    #[test]
+    fn mesh_culling_uses_one_unallocated_primitive_output() {
+        let words = [
+            0x7E10_0280u32, // v_mov_b32 v8, 0
+            0x7E12_02FF,    // v_mov_b32 v9, 0x200400
+            0x0020_0400,
+            0x7E14_02FF, // v_mov_b32 v10, 1.0
+            0x3F80_0000,
+            0xF800_0941,
+            0x0000_0009, // exp prim, v9, off, off, off done
+            0xF800_08CF,
+            0x0A08_0808, // exp pos0, v8, v8, v8, v10 done
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 11,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 64,
+                max_vertices: 128,
+                max_primitives: 128,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        };
+        let position = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let cull = SigElement {
+            name: "SV_CullPrimitive".into(),
+            index: 0,
+            kind: 30,
+            comp: 1,
+            interp: 1,
+            row: None,
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let osg1 = container::signature(&[position], false);
+        let psg1 = container::signature(&[cull], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1), (FourCC::PSG1, &psg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        let out = Container::parse(&out.dxil).unwrap();
+        assert_eq!(out.part(FourCC::PSG1).unwrap().data, psg1);
+        let psv = out.part(FourCC::PSV0).unwrap().data;
+        assert_eq!(psv[4 + 26], 0, "cull flag must not allocate a row");
+        assert_eq!(psv[4 + 30], 1, "exactly one primitive output");
     }
 
     /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
