@@ -217,25 +217,35 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waits for `p` until frame `frame`'s deadline.
 fn wait(p: &Pending, frame: u64) {
-    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-    static WAITED_US: AtomicU64 = AtomicU64::new(0);
-    if FRAME.swap(frame, Ordering::Relaxed) != frame {
-        WAITED_US.store(0, Ordering::Relaxed);
-    }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
-    let started = Instant::now();
+    let deadline = frame_deadline(frame, Instant::now());
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
+        let rest = deadline.saturating_duration_since(Instant::now());
         if rest.is_zero() {
             break;
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// When waits in frame `frame` end: [`BUDGET`] after its first wait, in
+/// wall time, for every recording thread at once. (A count of time waited,
+/// read before each wait and added after it, let threads waiting together
+/// each take the whole budget: seconds a frame in the world.)
+fn frame_deadline(frame: u64, now: Instant) -> Instant {
+    static DEADLINE: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
+    let mut deadline = DEADLINE.lock().unwrap_or_else(|e| e.into_inner());
+    match *deadline {
+        Some((f, at)) if f == frame => at,
+        _ => {
+            let at = now + BUDGET;
+            *deadline = Some((frame, at));
+            at
+        }
+    }
 }
 
 /// Pipelines for the workers: those draws wait for, then those started
@@ -368,5 +378,18 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// Every wait of a frame shares one deadline, set by its first wait;
+    /// the next frame starts its own.
+    #[test]
+    fn waits_of_one_frame_share_one_deadline() {
+        let (frame, now) = (u64::MAX - 7, Instant::now());
+        let first = frame_deadline(frame, now);
+        assert_eq!(first, now + BUDGET);
+        // Another thread, later in the same frame: the same deadline.
+        assert_eq!(frame_deadline(frame, now + Duration::from_millis(300)), first);
+        let later = now + Duration::from_millis(600);
+        assert_eq!(frame_deadline(frame + 1, later), later + BUDGET);
     }
 }

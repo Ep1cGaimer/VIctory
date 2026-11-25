@@ -92,9 +92,12 @@ fn last(kind: u32) -> &'static AtomicU64 {
     &LAST[(kind as usize).min(LAST.len() - 1)]
 }
 
-/// The next tick after now and after the last one a wait for `kind` took
-/// (an event happens once per tick: a wait woken a little early must not
-/// let the next one end on the same tick), and how long until it. A wait
+/// The tick a wait for `kind` ends on, and how long until it: the first
+/// after the last one a wait for `kind` took (an event happens once per
+/// tick: a wait woken a little early must not let the next one end on the
+/// same tick), and not before the latest tick so far. A wait that comes
+/// after a tick it has not taken yet (a late frame) ends at once on it,
+/// as a latched event would, instead of losing up to a whole interval. A wait
 /// that comes within `limit` takes the tick here, under the clock's lock,
 /// so two threads waiting for one kind never take the same tick.
 fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
@@ -106,14 +109,20 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     });
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
-    let tick =
-        (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
-    let at = u128::from(tick - c.first) * interval;
-    let wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+    let (tick, wait) = tick_for(c.first, elapsed, interval, last(kind).load(Ordering::Relaxed));
     if wait <= limit {
         last(kind).fetch_max(tick, Ordering::Relaxed);
     }
     (tick, wait)
+}
+
+/// [`next_tick`]'s choice: ticks are `first` plus whole `interval`s (ns)
+/// from the clock's start, `elapsed` ns ago; `last` the one taken last.
+fn tick_for(first: u64, elapsed: u128, interval: u128, last: u64) -> (u64, Duration) {
+    let latest = first + (elapsed / interval) as u64;
+    let tick = latest.max(last + 1);
+    let at = u128::from(tick - first) * interval;
+    (tick, Duration::from_nanos(at.saturating_sub(elapsed) as u64))
 }
 
 /// Device method: blocks until the next tick (or the time-out); an origin
@@ -193,6 +202,9 @@ mod tests {
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
         assert!(second > first);
         assert!(before.elapsed() <= Duration::from_millis(50));
+        // A poll with no tick due times out. (On 2 ms ticks a sleep's
+        // overshoot passes a tick, which a late wait takes at once: 50 ms.)
+        assert_eq!(set_interval(null, null, 50_000, 1, 0), S_OK);
         assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
@@ -242,5 +254,26 @@ mod tests {
         assert!(second > first, "{second} after {first}");
         next_tick(VBLANK, Duration::ZERO);
         assert_eq!(last(VBLANK).load(Ordering::Relaxed), second);
+    }
+
+    /// On time, a wait ends on the next tick; late (a tick passed that it
+    /// has not taken), at once on that tick, and only once: the wait after
+    /// it takes the next tick again.
+    #[test]
+    fn a_late_wait_ends_at_once_on_the_tick_it_missed() {
+        const I: u128 = 16_666_667;
+        // Tick 3 taken at 3 I; now 3.5 I: tick 4, in half an interval.
+        let (tick, wait) = tick_for(0, 7 * I / 2, I, 3);
+        assert_eq!(tick, 4);
+        assert_eq!(wait, Duration::from_nanos((4 * I - 7 * I / 2) as u64));
+        // Tick 3 taken, now 4.5 I (a slow frame): tick 4, no wait.
+        assert_eq!(tick_for(0, 9 * I / 2, I, 3), (4, Duration::ZERO));
+        // Tick 4 taken, still 4.5 I: tick 5.
+        assert_eq!(tick_for(0, 9 * I / 2, I, 4).0, 5);
+        // Far behind (tick 3 taken, now 9.2 I): the latest tick, 9, once.
+        assert_eq!(tick_for(0, 92 * I / 10, I, 3), (9, Duration::ZERO));
+        assert_eq!(tick_for(0, 92 * I / 10, I, 9).0, 10);
+        // Ticks counted from `first`.
+        assert_eq!(tick_for(100, 9 * I / 2, I, 103), (104, Duration::ZERO));
     }
 }

@@ -6,7 +6,11 @@
     [switch]$Warp,
     [switch]$Validation,
     [string]$Console,
-    [string]$EnvVars
+    [string]$EnvVars,
+    # A cache folder shared across runs (shaders and the pipeline library),
+    # e.g. one filled by `victory translate --cache --pipelines`; outside the
+    # game folder. Default: a fresh one per run.
+    [string]$CacheDir
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -14,7 +18,8 @@ $package = 'C:\Games\GTA6.Xbox.v1.0.2.1-CYBERLEEK'
 $originalProfile = Join-Path $env:TEMP 'victory-readonly-run-20261124\hardware\data'
 $env:VICTORY_GAME_DIR = $package
 $env:VICTORY_DATA_DIR = Join-Path $RunDir 'data'
-$env:VICTORY_CACHE_DIR = Join-Path $RunDir 'cache'
+$env:VICTORY_CACHE_DIR = if ($CacheDir) { $CacheDir } else { Join-Path $RunDir 'cache' }
+if ($env:VICTORY_CACHE_DIR.StartsWith($package, [StringComparison]::OrdinalIgnoreCase)) { throw 'The cache must not be inside the game folder.' }
 $env:VICTORY_CAPTURE = Join-Path $RunDir 'frames'
 $env:VICTORY_CAPTURE_FRAMES = '120,300,450,600,750,900,1050,1200,1500,1800,2100,2400,2700,3000,3600'
 $env:VICTORY_CONFIG = Join-Path $RunDir 'isolated.toml'
