@@ -957,6 +957,13 @@ impl State {
             compute_dropped();
             return;
         }
+        // The ray-tracing structure builder's stages run all or none.
+        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -1658,6 +1665,10 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
+        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            why("a stage of the ray-tracing structure builder, which is off");
+            return false;
+        }
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);

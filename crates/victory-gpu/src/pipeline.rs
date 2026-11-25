@@ -114,6 +114,20 @@ impl Shader {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
                 let (done, cached) = translate(&self.container);
                 let ms = started.elapsed().as_millis() as u64;
+                // `VICTORY_SHADER_SAVE=<dir>` (with `VICTORY_SHADER_SAVE_ONLY`
+                // naming hashes, comma separated): each shader as the title
+                // gave it (`.cdxil`) and as translated (`.dxil`).
+                if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE")
+                    && std::env::var("VICTORY_SHADER_SAVE_ONLY").map_or(true, |only| only.split(',').any(|h| h.trim() == self.hash))
+                {
+                    let dir = std::path::PathBuf::from(dir);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let stem = format!("{}.{}", self.hash, self.stage);
+                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
+                    if let Ok(t) = &done {
+                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+                    }
+                }
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
                     Ok(t) => tracing::info!(
@@ -209,8 +223,94 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    /// One of the ray-tracing structure builder's ([`Builder`]).
+    #[cfg(windows)]
+    builder: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
+
+/// The compute pipelines of the console's ray-tracing structure builder
+/// (`XboxBvhBuilder.dll`; its programs are the ones whose root parameters
+/// are in a spilled user-data table) run **all or none**. Its stages feed
+/// each other through memory: a stage that runs on what a dropped stage
+/// (refused, say, for wave64 on this card) never wrote computes its store
+/// offsets from garbage, and the structures lie in plain title memory
+/// between the title's own objects. Ported from ztrx main (`pipeline.rs`,
+/// its run 98: with 14 of 35 stages running the title died within a second
+/// on pointers that had become bounding-box bit patterns); the programs
+/// that walk the structures then also walk garbage.
+///
+/// So a builder dispatch runs only with `VICTORY_BVH_BUILDER=1` and while
+/// every builder pipeline the title has created has a host pipeline (made
+/// on the spot at the first builder dispatch); one that cannot be made
+/// turns the builder off for the rest of the run.
+#[cfg(windows)]
+struct Builder {
+    pipelines: Vec<Arc<make::Pending>>,
+    /// Every one of `pipelines` has a host pipeline.
+    whole: bool,
+    /// One could not be made.
+    off: bool,
+}
+
+#[cfg(windows)]
+static BUILDER: Mutex<Builder> = Mutex::new(Builder { pipelines: Vec::new(), whole: false, off: false });
+
+/// Whether `shaders` are a pipeline of the structure builder: a compute
+/// program whose user-data entries past its user SGPRs start at index 16
+/// (the table's address in user data 0 and 1).
+#[cfg(windows)]
+fn of_builder(shaders: &[Arc<Shader>]) -> bool {
+    use victory_shader::native::StageIo;
+    use victory_shader::{Container, FourCC, HwStage};
+    let [shader] = shaders else { return false };
+    if shader.stage != "compute" {
+        return false;
+    }
+    let Ok(c) = Container::parse(&shader.container) else { return false };
+    let spilled = |n: &victory_shader::NativeProgram| {
+        let StageIo::Cs(cs) = &n.io else { return false };
+        let registers = u32::from(cs.user_sgprs());
+        let first = n.layout.iter().filter(|e| e.sgprs > 0 && u32::from(e.user_data) >= registers).map(|e| u32::from(e.user_data)).min();
+        n.stage == HwStage::Cs && registers >= 2 && first == Some(16)
+    };
+    c.part(FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(spilled))
+}
+
+/// Whether the title's pipeline `this` is one of the structure builder's.
+#[cfg(windows)]
+pub(crate) fn is_builder(this: This) -> bool {
+    !this.is_null() && pipeline(this).builder
+}
+
+/// At a dispatch of a builder pipeline: whether the builder runs (see
+/// [`Builder`]).
+#[cfg(windows)]
+pub(crate) fn builder_runs() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    if b.off {
+        return false;
+    }
+    if b.whole {
+        return true;
+    }
+    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
+    if missing > 0 {
+        b.off = true;
+        tracing::warn!(missing, of = b.pipelines.len(), "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none");
+        return false;
+    }
+    tracing::info!(pipelines = b.pipelines.len(), "the ray-tracing structure builder runs: all of its programs have host pipelines");
+    b.whole = true;
+    true
+}
+
 
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
@@ -367,11 +467,22 @@ fn hand_out(
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
     make::early(&host);
+    #[cfg(windows)]
+    let builder = of_builder(&shaders);
+    #[cfg(windows)]
+    if builder {
+        tracing::warn!(shaders = ?shaders, "a pipeline of the ray-tracing structure builder: it runs only with the whole builder (VICTORY_BVH_BUILDER=1)");
+        let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+        b.pipelines.push(host.clone());
+        b.whole = false;
+    }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        builder,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

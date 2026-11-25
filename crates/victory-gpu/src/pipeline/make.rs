@@ -174,6 +174,13 @@ pub(crate) fn waiting() -> u64 {
 
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
+/// Makes `p` on this thread if no one has yet; whether it has a host
+/// pipeline.
+pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    p.make();
+    p.made.get().is_some_and(|made| made.is_some())
+}
+
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // Listed for an early start in later runs from its first use, made or
     // not: one a run never got made is the one it should start early.
