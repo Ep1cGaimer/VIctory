@@ -317,6 +317,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sparse_copy_keeps_readable_pages_and_zeroes_holes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+
+        struct Reservation(*mut std::ffi::c_void);
+        impl Drop for Reservation {
+            fn drop(&mut self) {
+                // SAFETY: the original allocation base, held by the test.
+                unsafe { VirtualFree(self.0, 0, MEM_RELEASE) };
+            }
+        }
+
+        const PAGE: usize = 4 << 10;
+        const TAIL: usize = 3 * (64 << 10);
+        const START: usize = 17;
+        const TAIL_BYTES: usize = 31;
+        // SAFETY: reserves a private range in the test process.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                TAIL + 2 * PAGE,
+                MEM_RESERVE,
+                PAGE_NOACCESS,
+            )
+        };
+        assert!(!base.is_null());
+        let _reservation = Reservation(base);
+        let base = base.cast::<u8>();
+        let commit = |offset, protection| {
+            let address = base.wrapping_add(offset).cast();
+            // SAFETY: a page inside this test's reservation.
+            let page = unsafe { VirtualAlloc(address, PAGE, MEM_COMMIT, protection) };
+            assert_eq!(page.cast_const(), address);
+            page.cast::<u8>()
+        };
+        let first = commit(0, PAGE_READWRITE);
+        commit(TAIL, PAGE_NOACCESS);
+        let last = commit(TAIL + PAGE, PAGE_READWRITE);
+        // SAFETY: both pages are committed and writable.
+        unsafe {
+            first.write_bytes(0x31, PAGE);
+            last.write_bytes(0x52, PAGE);
+        }
+        assert_eq!(
+            source_region(base as usize + PAGE),
+            Some((base as usize + TAIL, true)),
+        );
+
+        let len = TAIL + PAGE + TAIL_BYTES - START;
+        let src = base.wrapping_add(START);
+        let mut bytes = vec![0xa5; len + 2];
+        let dst = bytes[1..].as_mut_ptr();
+        // Confirm this takes the same fallback path as `copy_mapped`.
+        assert!(!read(src, dst, len));
+        copy_sparse(dst, src, len);
+        assert_eq!(bytes[0], 0xa5);
+        let (first, rest) = bytes[1..1 + len].split_at(PAGE - START);
+        let (hole, last) = rest.split_at(rest.len() - TAIL_BYTES);
+        assert!(first.iter().all(|&b| b == 0x31));
+        assert!(hole.iter().all(|&b| b == 0));
+        assert!(last.iter().all(|&b| b == 0x52));
+        assert_eq!(bytes[len + 1], 0xa5);
+    }
+
+    #[test]
     fn adapter_choice() {
         assert_eq!(adapter_name(&[b'R' as u16, b'T' as u16, b'X' as u16, 0, b'X' as u16]), "RTX");
         // A name nothing has fails instead of falling back to another GPU.
@@ -1290,8 +1357,8 @@ impl HostList {
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// range that covers them. A GPU write flushes its own buffer copy before
+/// the snapshot. A title write or list submission flushes every buffer copy.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -1319,10 +1386,16 @@ impl Batch {
         len: usize,
     ) {
         if self.new_gpu_write(shadow, address, len) {
-            // The first declaration needs the refreshed bytes for its snapshot.
-            // Another declaration of this exact range is already pending until
-            // the GPU submission finishes, so it needs no refresh boundary.
-            self.flush();
+            // The snapshot reads this shadow's host buffer. Other shadows
+            // can keep accumulating refreshes until their own boundary.
+            if let Some(index) = self
+                .refreshes
+                .iter()
+                .position(|(pending, ..)| std::sync::Arc::ptr_eq(pending, shadow))
+            {
+                let (_, from, to) = self.refreshes.remove(index);
+                Self::refresh(shadow, from, to);
+            }
             shadow.writing(address, len);
             self.gpu_writes.push((shadow.clone(), address, len));
         }
@@ -1355,14 +1428,18 @@ impl Batch {
 
     fn flush(&mut self) {
         for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            Self::refresh(&shadow, from, to);
         }
+    }
+
+    fn refresh(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, us, 0);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
 }
 
@@ -1403,22 +1480,61 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
-                }
-            });
+    copy_sparse(dst, src, len);
+}
+
+/// Retries a failed bulk read in 64 KiB blocks, then 4 KiB pages. A whole
+/// reserved or free region needs only one zero fill if a page read fails.
+fn copy_sparse(dst: *mut u8, src: *const u8, len: usize) {
+    const BLOCK: usize = 64 << 10;
+    const PAGE: usize = 4 << 10;
+    let start = src as usize;
+    let end = start + len;
+    let mut at = start;
+    let mut queried_until = start;
+    while at < end {
+        let block_end = piece_end(at, end, BLOCK);
+        let to = dst.wrapping_add(at - start);
+        if read(at as *const u8, to, block_end - at) {
+            at = block_end;
+            continue;
         }
-    });
+        while at < block_end {
+            let mut next = piece_end(at, block_end, PAGE);
+            let to = dst.wrapping_add(at - start);
+            if !read(at as *const u8, to, next - at) {
+                if at >= queried_until
+                    && let Some((region_end, unmapped)) = source_region(at)
+                {
+                    queried_until = region_end;
+                    if unmapped {
+                        next = region_end.min(end);
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Unmapped, (next - at) as u64);
+                // SAFETY: inside the destination, which is mapped.
+                unsafe { to.write_bytes(0, next - at) };
+            }
+            at = next;
+        }
+    }
+}
+
+/// End of the source region containing `at`, and whether it has no
+/// committed memory. Other regions still get a guarded read per page.
+fn source_region(at: usize) -> Option<(usize, bool)> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: the query fills this plain output structure when it succeeds.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointer has storage for the full output structure.
+    if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+        return None;
+    }
+    let end = (info.BaseAddress as usize).checked_add(info.RegionSize)?;
+    (end > at).then_some((end, matches!(info.State, MEM_FREE | MEM_RESERVE)))
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -1468,10 +1584,14 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
     let end = start + len;
     let mut at = start;
     while at < end {
-        let next = ((at / step + 1) * step).min(end);
+        let next = piece_end(at, end, step);
         f(at, next - at);
         at = next;
     }
+}
+
+fn piece_end(at: usize, end: usize, step: usize) -> usize {
+    ((at / step + 1) * step).min(end)
 }
 
 impl Host {
