@@ -93,7 +93,22 @@ Use the harness in `tools/lab/`: `run-probe.ps1` is the launcher and `gpumem.ps1
 - **f8c134d** One loop budget per lane for the whole program: 2^16 iterations in total over all loops, held in a private global `loop.budget`. Nested data-driven loops used to multiply their per-loop limits; hair strand, pre-skin and ambient-map compute shaders hung the GPU.
 - **22cb245** and earlier: Series S plane compositing; full dynamic descriptor slots on the capped view heap; host device on the high-performance adapter.
 
-## Current state in game
+## v2 branch on this laptop (`victory-world-30fps-v2`, 2026-11-25)
+
+`victory-world-30fps-v2` is our work rebased on upstream main 940d32f (the plan v2 steps); pushed to origin. Upstream has nothing newer. Tests: `cargo test -p victory-gpu` 154 pass (157 with `--features diagnostics`).
+
+- **Boot crash, fixed (80a6d5c).** v2 crashed 3 s in with a null write in title code at `+0x2215c35`. That is the title's own watchdog: it writes to address 0 when a thread stops checking in. The cause was our "title slot past the host heap" warning, logged once per slot as the title walks its 1,245,184-slot heap. NVIDIA caps the host heap at 1,000,000, and the title side makes 737,856 slots usable. That was 280,000 lines in 32 s. The warning now logs once per 65,536 slots, and the boot reaches loading. Menus hold 30.0 fps.
+- **Depth-plane copies are skipped (80a6d5c).** The title copies the depth of an `R32G8X24` texture into an `R32` one, which is an invalid host copy. The device was removed 11 ms after it. Without a trace, NVIDIA's driver faulted inside `CopyTextureRegion` at the same point. This is unconfirmed as the cause, because those runs also ran out of memory there; the "skipping GPU copy" warning has not fired yet. `VICTORY_LOG=...,victory_gpu::copytrace=trace` logs every texture copy.
+- **Blocker now: out of memory while loading into the world.** Hardware: 8 GB of VRAM, 15.3 GB of RAM, so a shared budget of about 7.6 GB.
+  - On Series X, v2 fills 7.6 GB dedicated and 7.2 GB shared. Then a host command list fails to close with `E_OUTOFMEMORY` (or the device is removed).
+  - Measured with the counters from d626e68 (the "host memory made" line under copystat), at failure: textures 9.0 GB made (3,600), loose copies 2.8 GB live covering 2.45 GB, whole-buffer copies 1.2 GB, depth twins 0.3 GB, view copies 0.2 GB. Command lists stay flat at 627.
+  - The old branch binary (`victory-wip3-diag.exe`) reaches the world on the same machine: 4.5/0.8 GB dedicated/shared at the menus, against v2's 5.2/2.1 GB. Upstream's heap-picked views (c75fdba and later) copy every buffer view the title writes, not only the ones draws use.
+  - On Series S, the boot needs about half as much (textures 2.4 GB), but the device was still removed early in loading.
+- **Sampler:** `powershell -File gpumem.ps1 -Name victory -Seconds N -Out file` reads the per-process "GPU Process Memory" counters every 2 s. Its source is in the session scratchpad; it is a small `Get-Counter` loop over `InstanceName -like pid_<pid>_*`.
+- **Also seen on NVIDIA:** about 25 compute pipelines refused, of which 4 ask for 64-lane waves (the RTX 4060 has 32). One `SetComputeRootSignature` comes before `SetDescriptorHeaps` with a directly indexed sampler heap.
+- **Pacing (3cc82a8):** a frame's pipeline waits share one 500 ms deadline, where each thread used to get its own. A frame wait that comes after a tick it missed ends at once.
+
+## Current state in game (old branch)
 
 - The world loads and draws: 700–3400 draws per frame, at about **0.5–1.4 fps**.
 - **Cost per frame (ss9):**
@@ -130,6 +145,11 @@ Merge one branch at a time. After each merge, rerun the shader tests, clippy and
 
 ## Next steps (by impact on the goal)
 
+0. **v2: fit the world in this laptop's memory.** In order:
+   - Count textures live, not only made: a title-released texture must free its host texture, so 9 GB made may be far less live.
+   - Free loose copies nobody holds, as `exact()` does with weak entries.
+   - Make buffer copies only for views that draws use.
+   - Then re-run Series X and Series S with the sampler and look for the "skipping GPU copy" line.
 1. **Stop the world hang.** Run with the mesh fix and all pipelines enabled. Check which shader and command the next DRED breadcrumb names. Keep timing active until the world has drawn for at least two minutes.
 2. **Wave64 compute.** Dropped compute passes break culling, lighting and indirect draws, and can force the indirect-draw gate closed. A correct emulation needs logical lane IDs, ballot and lane exchange semantics, and ordering across the two host waves, including shared memory.
 3. **Copy cost.** The last three ss10 windows reported 118–297 ms/frame in write-watch calls and 167–206 MB/frame of unmapped reads. `Batch::gpu_write` can flush just the shadow it snapshots and leave other refreshes coalesced. Retain full flushes before title-memory writes and submission. Separately, skip known reserved spans after a failed read in the sparse-copy fallback. Compare `copystat` under the same world workload.
