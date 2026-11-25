@@ -1,3 +1,71 @@
+# VIctory fork for NVIDIA GeForce (work in progress)
+
+This is a fork of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak
+and its contributors, on branch `victory-world-30fps-v2`: upstream `main`
+(`940d32f`) plus fixes found while running the game's world on an
+**NVIDIA** laptop GPU. It contains no game files, code or assets; you need
+your own copy of the game.
+
+## State of this fork (2026-11-25)
+
+**Not playable yet: well under 1 to about 2 frames per second in the world.**
+Tested on one machine only: Windows 11, **NVIDIA GeForce RTX 4060 Laptop
+GPU 8 GB**, 15.3 GB RAM (an AMD Radeon 780M integrated GPU is present too;
+VIctory runs on the NVIDIA card, check the "host adapter" log line), Series X
+profile.
+
+| What | State on that machine |
+|------|-----------------------|
+| Boot, menus | work, 30 fps |
+| Loading into the world | works (lazy host textures keep it inside 8 GB) |
+| The world | reached and drawn; frames take 0.4 to several seconds |
+| GPU time per heavy frame | about 1.7 s by default; about 0.43 s with `VICTORY_SHADER_LOOP_LIMIT=256` |
+| CPU time per frame | 0.3 to 6 s, mostly copies of title memory (200 to 400 MB a frame) |
+| Memory | grows to 20+ GB committed over minutes |
+
+### Why NVIDIA is slower than AMD here
+
+The console runs most compute programs in 64-lane waves. NVIDIA cards only
+run 32-lane waves, so about 130 of the game's compute pipelines are refused
+on this card (AMD cards run them natively). Their outputs are never
+written, and the programs that read them (wind, sky and fog scattering) loop
+on garbage counts until the translator's loop limit stops them: about
+1.3 s of GPU time a frame. Work in progress ports a way to run these
+programs as two 32-lane halves (`VICTORY_WAVE_HALVES=1`, off by default: with
+it the game currently stalls at the account picker). See
+[docs/handoff-victory-world-30fps.md](docs/handoff-victory-world-30fps.md)
+for measurements and next steps.
+
+### What this fork changes over upstream (highlights)
+
+- Translated shaders clamp heap indices to the host's real view heap
+  (1,000,000 on NVIDIA) and view addresses cover dynamic slots and BVHs
+  (a device hang entering the world).
+- The ray-tracing structure builder runs all or none, off by default
+  (`VICTORY_BVH_BUILDER=1`); with some stages refused it wrote garbage into
+  title memory.
+- Host textures of textures only read are made on first use (loading no
+  longer runs out of video memory on 8 GB).
+- Depth-plane copies the host cannot do are skipped; watchdog-triggering log
+  floods removed.
+- Diagnostics: `VICTORY_GPU_TIMING=1` (slow commands by pipeline),
+  `VICTORY_SHADER_SAVE=<dir>` (shaders as given and as translated),
+  `VICTORY_SKIP_PIPELINES=<hash,...>`.
+
+### Credits
+
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
+  contributors is the base of everything here (GPL-3.0-or-later; so is this
+  fork).
+- The BVH builder gate and the wave64-in-two-halves lowering are ported from
+  [Zettrox/ztrx](https://github.com/Zettrox/ztrx) `main` (GPL-3.0-or-later).
+- Developed with [Claude Code](https://claude.com/claude-code).
+
+Everything below this line is upstream VIctory's own README; its status
+section describes upstream on upstream's AMD test machine, not this fork.
+
+---
+
 # VIctory
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files

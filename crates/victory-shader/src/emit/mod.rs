@@ -196,6 +196,7 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+pub use lower::{host_max_wave, set_host_max_wave};
 mod rect;
 pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]

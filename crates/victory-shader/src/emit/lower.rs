@@ -227,6 +227,19 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// A console wave64 program run as two host waves of 32 (ztrx main's
+    /// lowering, first part): a group barrier before every LDS access in
+    /// blocks every lane runs, the console sharing LDS within its wave
+    /// without barriers.
+    split_lds: bool,
+    /// With `split_lds`, LDS accesses in lane branches: per IR block whether
+    /// every lane runs it, and whether the host waves meet at its start and
+    /// before its exit ([`lds_meetings`]).
+    lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
+    /// A console wave64 program in host waves of 32: the LDS dword counting
+    /// the console threads handed to host waves ([`Lower::wave_base`]).
+    halves: Option<u32>,
+    wave_base: Option<V>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -479,6 +492,201 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// The widest wave the host GPU runs (0: not known); see [`set_host_max_wave`].
+static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The host GPU's `WaveLaneCountMax`, before anything is translated: 32
+/// lets console wave64 compute programs whose cross-lane code stays inside
+/// 32-lane halves run in waves of 32 instead of being refused. Part of the
+/// translation: a shader cache keys on it.
+pub fn set_host_max_wave(lanes: u32) {
+    HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`set_host_max_wave`].
+pub fn host_max_wave() -> u32 {
+    HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Masks held as numbers or constant lane sets in guards or lane branches:
+/// the lane tests its own bit by its console lane.
+fn lane_constant_masks(st: &Structured) -> bool {
+    let whens = st.exits.iter().filter_map(|e| match *e {
+        LaneExit::Branch { when, .. } => Some(when),
+        _ => None,
+    });
+    let mut all: Vec<Bool> = st.guards.iter().flatten().flatten().copied().chain(whens).collect();
+    all.sort_unstable();
+    all.dedup();
+    all.into_iter().any(|g| {
+        st.bools
+            .support(g)
+            .iter()
+            .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+    })
+}
+
+/// Per IR block: every lane of the wave that started the program runs it –
+/// no per-lane branch separates it from the entry (it lies in no lane
+/// branch's region). None with an indirect exit. (From ztrx main.)
+fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+    let n = st.exits.len();
+    let mut all = vec![true; n];
+    for (_, region) in lane_regions(st)? {
+        for b in (0..n).filter(|&b| region[b]) {
+            all[b] = false;
+        }
+    }
+    Some(all)
+}
+
+/// Every per-lane branch (by its block) with its region: the blocks
+/// reachable from it that do not post-dominate it, which only some lanes
+/// run. Not branches on uniform conditions. None with an indirect exit.
+fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+    let n = st.exits.len();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, e) in st.exits.iter().enumerate() {
+        match *e {
+            LaneExit::Jump(t) => succ[b].push(t),
+            LaneExit::Branch { taken, not_taken, .. } => {
+                succ[b].push(taken);
+                succ[b].push(not_taken);
+            }
+            LaneExit::End => {}
+            LaneExit::Indirect => return None,
+        }
+    }
+    // post-dominators (bitsets; a virtual exit after every End)
+    let words = n.div_ceil(64);
+    let full = vec![u64::MAX; words];
+    let mut pdom: Vec<Vec<u64>> = (0..n)
+        .map(|b| {
+            if succ[b].is_empty() {
+                let mut v = vec![0; words];
+                v[b / 64] |= 1 << (b % 64);
+                v
+            } else {
+                full.clone()
+            }
+        })
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..n).rev() {
+            if succ[b].is_empty() {
+                continue;
+            }
+            let mut v = full.clone();
+            for &t in &succ[b] {
+                for w in 0..words {
+                    v[w] &= pdom[t][w];
+                }
+            }
+            v[b / 64] |= 1 << (b % 64);
+            if v != pdom[b] {
+                pdom[b] = v;
+                changed = true;
+            }
+        }
+    }
+    let mut regions = Vec::new();
+    for (d, e) in st.exits.iter().enumerate() {
+        let LaneExit::Branch { when, .. } = *e else { continue };
+        if st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
+            continue; // a uniform branch: all lanes go the same way
+        }
+        let mut seen = vec![false; n];
+        let mut stack: Vec<usize> = succ[d].clone();
+        while let Some(b) = stack.pop() {
+            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+                continue;
+            }
+            seen[b] = true;
+            stack.extend(succ[b].iter().copied());
+        }
+        regions.push((d, seen));
+    }
+    Some(regions)
+}
+
+/// LDS accesses of a console wave run as two host waves, where some sit in
+/// blocks that only some lanes run (`all` is [`all_lane_blocks`]): per IR
+/// block, whether the host waves meet (a group barrier) at its start and
+/// before its exit. `None` if barriers cannot keep the console's order.
+///
+/// The console runs the wave's lanes in step, so an LDS write is seen by
+/// every later read. Two host waves keep that order if they meet between
+/// any two accesses of which one writes. A barrier must be run by every
+/// thread, so it cannot stand in a lane branch's region; but every way into
+/// and out of such a region passes a block all lanes run, and the waves meet
+/// there. What that cannot order is a write and a read inside one region:
+/// refused. (From ztrx main.)
+/// shortcut: two writes in one region are taken not to hit the same dword
+/// from both halves.
+fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
+    let n = st.exits.len();
+    let succ = |b: usize| -> Vec<usize> {
+        match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    let mut region: Vec<usize> = (0..n).collect();
+    fn find(region: &mut [usize], mut b: usize) -> usize {
+        while region[b] != b {
+            region[b] = region[region[b]];
+            b = region[b];
+        }
+        b
+    }
+    for b in 0..n {
+        for t in succ(b) {
+            if !all[b] && !all[t] {
+                let (x, y) = (find(&mut region, b), find(&mut region, t));
+                region[x] = y;
+            }
+        }
+    }
+    let mut reads = vec![false; n];
+    let mut writes = vec![false; n];
+    for (b, block) in p.blocks.iter().enumerate().take(n) {
+        if all[b] {
+            continue;
+        }
+        let r = find(&mut region, b);
+        for i in &block.insts {
+            let name = i.name();
+            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
+                continue;
+            }
+            if name.starts_with("ds_read") {
+                reads[r] = true;
+            } else {
+                writes[r] = true;
+            }
+        }
+    }
+    if (0..n).any(|r| reads[r] && writes[r]) {
+        return None;
+    }
+    let mut meet = vec![(false, false); n];
+    for b in 0..n {
+        for t in succ(b) {
+            if all[b] && !all[t] {
+                let r = find(&mut region, t);
+                meet[b].1 |= reads[r] || writes[r];
+            } else if !all[b] && all[t] {
+                let r = find(&mut region, b);
+                meet[t].0 |= reads[r] || writes[r];
+            }
+        }
+    }
+    Some(meet)
+}
+
 /// The dwords an `s_load_dword*` reads.
 fn smem_dwords(name: &str) -> Option<u32> {
     match name.strip_prefix("s_load_dword")? {
@@ -511,6 +719,7 @@ impl<'a> Lower<'a> {
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
+        let (mut split_lds, mut lds_meet, mut halves) = (false, None, None);
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -525,30 +734,7 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
-            }) || {
-                // Masks held as numbers or constant lane sets: the lane
-                // tests its own bit by its console lane.
-                let whens = x.st.exits.iter().filter_map(|e| match *e {
-                    LaneExit::Branch { when, .. } => Some(when),
-                    _ => None,
-                });
-                let mut all: Vec<Bool> =
-                    x.st.guards
-                        .iter()
-                        .flatten()
-                        .flatten()
-                        .copied()
-                        .chain(whens)
-                        .collect();
-                all.sort_unstable();
-                all.dedup();
-                all.into_iter().any(|g| {
-                    x.st.bools
-                        .support(g)
-                        .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
-                })
-            };
+            }) || lane_constant_masks(x.st);
             // Implicit derivatives: the console's quads are lanes 4n..4n+3
             // (in whole-quad mode, `s_wqm`), and its waves hold runs of
             // flat thread ids, so a quad is four consecutive flat ids, x
@@ -562,8 +748,55 @@ impl<'a> Lower<'a> {
             if threads.is_multiple_of(4) && insts().any(|i| implicit_derivatives(i.name())) {
                 s.threads = Some([threads, 1, 1]);
             }
-            let wave = if x.native.wave64 { 64 } else { 32 };
+            let mut wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = threads <= wave;
+            // A host whose waves are at most 32 lanes (NVIDIA) refuses
+            // `WaveSize(64)`. A console wave64 program whose cross-lane code
+            // stays inside 32-lane halves (DPP rows, `ds_swizzle`,
+            // `v_permlane16` / `v_permlanex16`, which the ISA confines there)
+            // runs exactly in waves of 32, each host wave one half of a console
+            // wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
+            // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers
+            // or lane-constant masks). LDS the console shares within its one
+            // wave without barriers gets a group barrier before every access
+            // (`split_lds`), where every thread of the group gets there.
+            // Ported from ztrx main (`emit/lower.rs`); its LDS exchange for
+            // programs that cross halves is not.
+            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+                let crosses = insts().any(|i| {
+                    let n = i.name();
+                    n.starts_with("v_mbcnt")
+                        || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                        || n.starts_with("ds_permute")
+                        || n.starts_with("ds_bpermute")
+                        || reads_mask_as_data(x.st, i)
+                }) || lane_constant_masks(x.st);
+                let group: u32 = cs.threads.iter().product();
+                if !crosses && (s.lds_dwords == 0 || group <= 32) {
+                    wave = 32;
+                } else if !crosses && let Some(all) = all_lane_blocks(x.st) {
+                    let lds = |i: &Inst| {
+                        matches!(i.fields, Fields::Ds { .. })
+                            && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
+                    };
+                    let every = p.blocks.iter().enumerate().all(|(b, blk)| {
+                        blk.insts.iter().all(|i| !lds(i) || all.get(b).copied().unwrap_or(false))
+                    });
+                    if every {
+                        wave = 32;
+                    } else if let Some(meet) = lds_meetings(p, x.st, &all) {
+                        lds_meet = Some((all, meet));
+                        wave = 32;
+                    }
+                    split_lds = wave == 32;
+                }
+            }
+            if wave == 32 && x.native.wave64 {
+                // console threads go to host waves in the order the waves
+                // take them (`wave_base`)
+                halves = Some(s.lds_dwords);
+                s.lds_dwords += 1;
+            }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
@@ -656,6 +889,10 @@ impl<'a> Lower<'a> {
             heap: [false; 2],
             src0: None,
             console_lanes,
+            split_lds,
+            lds_meet,
+            halves,
+            wave_base: None,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -1323,6 +1560,9 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
+                self.lds_meeting();
+            }
             let mut i = 0;
             self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
@@ -1348,6 +1588,9 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
             self.mask_ok = self.mask_data == MaskData::Console;
+            if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) {
+                self.lds_meeting();
+            }
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
@@ -2809,7 +3052,12 @@ impl<'a> Lower<'a> {
             96,
             &[],
         );
-        let f = if self.console_lanes {
+        let f = if self.console_lanes && self.halves.is_some() {
+            let base = self.wave_base().expect("halves");
+            let lane = self.lane_index();
+            self.s.flags |= flags::WAVE_OPS;
+            self.s.m.bin(e, Bin::Add, base, lane)
+        } else if self.console_lanes {
             let first = self.s.op(
                 e,
                 "waveReadLaneFirst.i32",
@@ -2939,6 +3187,46 @@ impl<'a> Lower<'a> {
     /// The console wave size.
     fn wave(&self) -> u32 {
         if self.x.native.wave64 { 64 } else { 32 }
+    }
+
+    /// A console wave64 program in host waves of 32: the first console
+    /// thread of this host wave (0, 32, 64, ...). A GPU need not give a host
+    /// wave consecutive thread indices, so each wave takes the next 32 from an
+    /// LDS counter instead: every thread zeroes it, the group meets, each
+    /// wave's first lane adds 32 and the wave takes what it found.
+    /// Branch-free, in the entry block, which every thread runs. (From ztrx main.)
+    fn wave_base(&mut self) -> Option<V> {
+        let slot = self.halves?;
+        if let Some(v) = self.wave_base {
+            return Some(v);
+        }
+        let (e, i32t) = (self.s.entry, self.s.t.i32);
+        let lds = self.s.lds();
+        let k = self.s.m.i32(slot);
+        let ptr = self.s.m.element(e, lds, k);
+        let zero = self.s.m.i32(0);
+        self.s.m.store(e, ptr, zero);
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let first = self.s.m.cmp(e, pred::EQ, lane, zero);
+        let k32 = self.s.m.i32(32);
+        let add = self.s.m.select(e, first, k32, zero);
+        let ptr = self.s.m.element(e, lds, k);
+        let old = self.s.m.atomic(e, super::bitcode::Rmw::Add, ptr, add);
+        let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        self.s.flags |= flags::WAVE_OPS;
+        self.wave_base = Some(base);
+        Some(base)
+    }
+
+    /// The two host waves of a console wave meet (a group barrier with a
+    /// shared-memory fence): LDS writes before are seen by reads after.
+    fn lds_meeting(&mut self) {
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
     fn lane_index(&mut self) -> V {
@@ -3362,6 +3650,16 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        if self.split_lds
+            && matches!(inst.fields, Fields::Ds { .. })
+            && !(name.starts_with("ds_swizzle") || name.contains("permute"))
+            && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
+        {
+            // the two host waves of a console wave meet before each LDS
+            // access: what the other half wrote is visible, and what it
+            // still reads is not overwritten
+            self.lds_meeting();
+        }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),

@@ -108,6 +108,28 @@ pub(crate) fn probe_view_heap() {
                 })
                 .is_ok()
         };
+        // The widest wave the GPU runs: 32 (NVIDIA) gets console wave64
+        // compute programs whose cross-lane code stays in 32-lane halves
+        // translated for waves of 32.
+        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a feature query into a struct of its size.
+        if unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o1).cast(),
+                size_of_val(&o1) as u32,
+            )
+        }
+        .is_ok()
+        {
+            tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
+            // Off by default while it is being brought up: with it the
+            // title stalled at its account picker (one of the programs it
+            // lets run is suspected; not yet found).
+            if crate::switch::on("VICTORY_WAVE_HALVES") {
+                victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            }
+        }
         if !fits {
             victory_shader::emit::set_heap_views(PORTABLE_VIEWS);
             tracing::info!(views = PORTABLE_VIEWS, "host view heaps are capped: translations clamp heap indices below the cap");

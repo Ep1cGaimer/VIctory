@@ -159,6 +159,11 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
+    // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
+    // at most 32 lanes (as the runtime does on such a card).
+    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_host_max_wave(n);
+    }
     // Dumped shaders and validator reports are game-derived (rule #1).
     if let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP") {
         victory_core::ensure_outside_repo(Path::new(&dir))?;
