@@ -168,6 +168,15 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+#[derive(Eq, Hash, PartialEq)]
+struct HandleKey {
+    block: usize,
+    load: Site,
+    first: u8,
+    sampler: bool,
+    props: (u32, u32),
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -200,7 +209,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<HandleKey, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -562,6 +571,28 @@ impl<'a> Lower<'a> {
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
+            // A rowless cull value still adds one scalar per primitive to
+            // the validator's 32 KiB budget, counted at the declared maxima.
+            let scalars = |elements: &[SigElement]| -> u64 {
+                elements.iter().map(|e| u64::from(e.cols)).sum()
+            };
+            let vertices = u64::from(ms.max_vertices).next_multiple_of(32);
+            let primitives = u64::from(ms.max_primitives).next_multiple_of(32);
+            let bytes = 4 * (vertices * scalars(&s.outputs) + primitives * (scalars(&s.prims) + 1));
+            if bytes <= 32 * 1024 {
+                s.prims.push(SigElement {
+                    name: "SV_CullPrimitive".into(),
+                    index: 0,
+                    kind: 30,
+                    comp: 1,
+                    interp: 1,
+                    row: None,
+                    col: 0,
+                    cols: 1,
+                    usage: 1,
+                    half: false,
+                });
+            }
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
             s.mesh = Some(super::shader::Mesh {
@@ -2847,14 +2878,10 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh: the counts and the primitives no lane exports. The console's
-    /// counts come from one lane's allocation request, which DXIL cannot
-    /// express (one call, dominating every output write).
-    // shortcut: the counts are the declared maxima and each lane first culls
-    // its primitive (all indices 0, zero area), so primitives past the
-    // program's count are culled and vertices past it unused; this costs
-    // the host the unused vertex and primitive slots. Pass the program's own
-    // counts if that shows in frame time.
+    /// Mesh: declare the output counts and cull primitives until a lane
+    /// exports them. The console sends its counts from one lane, while
+    /// DXIL needs a single group-uniform call before any output stores.
+    /// Use the maxima limited to the slots the host lanes can write.
     fn mesh_prologue(&mut self, mesh: super::shader::Mesh) -> Result<(), Why> {
         let threads = self.s.threads.expect("mesh")[0];
         if mesh.topology != 2 {
@@ -2865,26 +2892,48 @@ impl<'a> Lower<'a> {
         }
         let e = self.s.entry;
         let void = self.s.t.void;
-        let (v, p) = (
-            self.s.m.i32(mesh.max_vertices),
-            self.s.m.i32(mesh.max_primitives),
-        );
+        let v = self.s.m.i32(mesh.max_vertices.min(threads));
+        let p = self.s.m.i32(mesh.max_primitives.min(threads));
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
         let flat = self.mesh_thread();
-        let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
+        let guard = self.mesh_bound(true, None);
         let at = self.begin_guarded(guard);
-        let z = self.s.m.i32(0);
-        self.s.op(
-            self.cur,
-            "emitIndices",
-            Attr::NoUnwind,
-            void,
-            169,
-            &[flat, z, z, z],
-        );
+        if let Some(id) = self.mesh_cull_output_id() {
+            let culled = self.s.m.i32(1);
+            self.store_mesh_cull(id, flat, culled);
+        } else {
+            let zero = self.s.m.i32(0);
+            self.s.op(
+                self.cur,
+                "emitIndices",
+                Attr::NoUnwind,
+                void,
+                169,
+                &[flat, zero, zero, zero],
+            );
+        }
         self.end_guarded(at, &[]);
         Ok(())
+    }
+
+    fn mesh_cull_output_id(&self) -> Option<u32> {
+        let last = self.s.prims.last()?;
+        (last.kind == 30).then_some(self.s.prims.len() as u32 - 1)
+    }
+
+    fn store_mesh_cull(&mut self, id: u32, primitive: V, culled: V) {
+        let id = self.s.m.i32(id);
+        let row = self.s.m.i32(0);
+        let col = self.s.m.i8(0);
+        self.s.op(
+            self.cur,
+            "storePrimitiveOutput.i32",
+            Attr::NoUnwind,
+            self.s.t.void,
+            172,
+            &[id, row, col, culled, primitive],
+        );
     }
 
     /// Mesh: `guard` and the lane's vertex (with `per_primitive`, its
@@ -4959,7 +5008,15 @@ impl<'a> Lower<'a> {
         }
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                // A dimensions query and an atomic can use the same slot
+                // with different component types on their DXIL handles.
+                let key = HandleKey {
+                    block: self.cur,
+                    load: *load,
+                    first: *first,
+                    sampler,
+                    props,
+                };
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -9436,36 +9493,53 @@ impl<'a> Lower<'a> {
     /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
     /// bits: a 9-bit vertex index and, above it, its edge flag (bits 9, 19
     /// and 29), which only the console's edge-flag rasterisation reads and
-    /// which is no part of the index. Bit 31 culls it (all indices 0: no
-    /// area), and so does an index past the declared vertex maximum, which
-    /// the host leaves undefined (a hang on some GPUs).
+    /// which is no part of the index. Bit 31 culls it, and so does an index
+    /// past the declared vertex maximum, which the host leaves undefined (a
+    /// hang on some GPUs): through the synthetic cull output when there is
+    /// room for one, else as a degenerate triangle.
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let max_vertices = self.s.mesh.expect("mesh").max_vertices;
+        let max_vertices = self
+            .s
+            .mesh
+            .expect("mesh")
+            .max_vertices
+            .min(self.s.threads.expect("mesh")[0]);
+        let limit = self.s.m.i32(max_vertices);
+        let mask = self.s.m.i32(0x1FF);
         let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut indices = Vec::new();
+        let primitive = self.mesh_thread();
+        let mut args = vec![primitive];
         for k in 0..3 {
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
+            let shift = self.s.m.i32(10 * k);
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
-            if max_vertices < 0x400 {
-                let limit = self.s.m.i32(max_vertices);
-                let past = self.s.m.cmp(c, pred::IUGE, i, limit);
-                culled = self.s.m.bin(c, Bin::Or, culled, past);
+            let past = self.s.m.cmp(c, pred::IUGE, i, limit);
+            culled = self.s.m.bin(c, Bin::Or, culled, past);
+            args.push(i);
+        }
+        let emit = if let Some(id) = self.mesh_cull_output_id() {
+            let one = self.s.m.i32(1);
+            let cull_value = self.s.m.select(c, culled, one, z);
+            self.store_mesh_cull(id, primitive, cull_value);
+            let live = self.s.m.cmp(c, pred::EQ, cull_value, z);
+            self.begin_guarded(Some(live))
+        } else {
+            // No room for a cull output. Use a degenerate triangle, as
+            // before, and never pass an out-of-range index to the host.
+            for i in &mut args[1..] {
+                *i = self.s.m.select(c, culled, z, *i);
             }
-            indices.push(i);
-        }
-        let mut args = vec![self.mesh_thread()];
-        for i in indices {
-            args.push(self.s.m.select(c, culled, z, i));
-        }
+            None
+        };
         let void = self.s.t.void;
         self.s
-            .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
+            .op(self.cur, "emitIndices", Attr::NoUnwind, void, 169, &args);
+        self.end_guarded(emit, &[]);
         self.end_guarded(at, &[]);
         Ok(())
     }
