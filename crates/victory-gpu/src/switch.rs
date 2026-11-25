@@ -15,6 +15,12 @@ pub(crate) fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
 }
 
+/// The number environment variable `name` holds, or `default` when it is
+/// unset or not a number.
+pub(crate) fn number(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::value_is_on;

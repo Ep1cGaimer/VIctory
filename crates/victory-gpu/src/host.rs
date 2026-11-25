@@ -2557,6 +2557,7 @@ impl Meter {
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
+        crate::memory::evict_loose();
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
@@ -3295,10 +3296,20 @@ pub(crate) mod mem {
     ];
     static BYTES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
     static COUNT: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+    /// Of those, freed since (kinds whose owners report it: title memory
+    /// copies).
+    static FREED_BYTES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+    static FREED: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
     pub(crate) fn add(kind: usize, bytes: u64) {
         BYTES[kind].fetch_add(bytes.next_multiple_of(1 << 16), Relaxed);
         COUNT[kind].fetch_add(1, Relaxed);
+    }
+
+    /// Something `add` counted, `bytes` as given there, is freed.
+    pub(crate) fn sub(kind: usize, bytes: u64) {
+        FREED_BYTES[kind].fetch_add(bytes.next_multiple_of(1 << 16), Relaxed);
+        FREED[kind].fetch_add(1, Relaxed);
     }
 
     /// The size `resource` takes, as the host places it.
@@ -3308,16 +3319,49 @@ pub(crate) mod mem {
         unsafe { host.device.GetResourceAllocationInfo(0, &[resource.GetDesc()]).SizeInBytes }
     }
 
+    /// Our process's commit (private bytes) and working set.
+    fn process_memory() -> (u64, u64) {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut c = PROCESS_MEMORY_COUNTERS {
+            cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: our own process and a sized structure.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+        (c.PagefileUsage as u64, c.WorkingSetSize as u64)
+    }
+
     pub(crate) fn log() {
         let parts: Vec<String> = (0..NAMES.len())
             .map(|i| format!("{} {:.0} MB ({})", NAMES[i], BYTES[i].load(Relaxed) as f64 / 1048576.0, COUNT[i].load(Relaxed)))
             .collect();
-        let (loose, covered) = crate::shadow::loose_coverage();
+        let (loose, covered, asked) = crate::shadow::loose_coverage();
         tracing::info!(
             "host memory made: {}; loose copies live {:.0} MB covering {:.0} MB",
             parts.join(", "),
             loose as f64 / 1048576.0,
             covered as f64 / 1048576.0
+        );
+        let mb = |b: u64| b as f64 / 1048576.0;
+        let live = |k: usize| (BYTES[k].load(Relaxed).saturating_sub(FREED_BYTES[k].load(Relaxed)), COUNT[k].load(Relaxed).saturating_sub(FREED[k].load(Relaxed)));
+        let ((whole, nw), (windows, nl), (views, nv)) = (live(super::mem::WHOLE), live(super::mem::LOOSE), live(super::mem::VIEW));
+        let (exact, exact_bytes) = crate::shadow::views_live();
+        let (pool, pooled) = crate::shadow::pool_held();
+        let (evicted, evicted_bytes) = crate::shadow::evicted();
+        let (commit, working) = process_memory();
+        tracing::info!(
+            "host memory live: buffer copies {:.0} MB ({nw}), loose windows {:.0} MB ({nl}; lookups asked for {:.0} MB of their pages; {evicted} given up, {:.0} MB), \
+             view copies {:.0} MB ({nv}; {exact} found, {:.0} MB); snapshot pool {:.0} MB ({pooled}); process commit {:.0} MB, working set {:.0} MB",
+            mb(whole),
+            mb(windows),
+            mb(asked),
+            mb(evicted_bytes),
+            mb(views),
+            mb(exact_bytes),
+            mb(pool),
+            mb(commit),
+            mb(working)
         );
     }
 }

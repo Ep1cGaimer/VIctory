@@ -322,6 +322,20 @@ impl Shared {
     }
 }
 
+/// Gives up loose windows of title memory nothing uses
+/// ([`crate::shadow::evict_loose`]), counting the page tables' hold on
+/// them. Page tables are locked first, as `prepare` does.
+pub(crate) fn evict_loose() {
+    let shared = shared();
+    let mut held: HashMap<usize, usize> = HashMap::new();
+    for (_, s) in shared.iter() {
+        for c in &s.layout.copies {
+            *held.entry(Arc::as_ptr(c) as usize).or_default() += 1;
+        }
+    }
+    crate::shadow::evict_loose(|copy| held.get(&copy).copied().unwrap_or(0));
+}
+
 /// The page table of view heap `key`, as the last submission using it
 /// left it.
 fn layout(key: usize) -> Arc<Layout> {

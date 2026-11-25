@@ -46,6 +46,16 @@ pub(crate) struct Shadow {
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
     marks: Option<u32>,
+    /// What kind of copy it is (`crate::host::mem`: whole buffer, loose
+    /// window or view copy), for the live-memory counts.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    kind: usize,
+    /// When a lookup last found it (loose windows), ms on [`clock`].
+    used: std::sync::atomic::AtomicU64,
+    /// Loose windows (diagnostics): the 64 KiB pages lookups asked for, a
+    /// bit each, so that the log tells how much of the windows is used.
+    #[cfg(feature = "diagnostics")]
+    asked: Box<[std::sync::atomic::AtomicU64]>,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -79,14 +89,25 @@ fn give_back(v: Vec<u8>) {
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let mut total = 0;
+    let most = pool_bytes();
     pool.retain(|v| {
         total += v.capacity();
-        total <= POOL_BYTES
+        total <= most
     });
 }
 
-/// Snapshot memory kept for reuse.
-const POOL_BYTES: usize = 2 << 30;
+/// Snapshot memory kept for reuse (`VICTORY_SNAPSHOT_POOL_MB`, 2048).
+fn pool_bytes() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| (crate::switch::number("VICTORY_SNAPSHOT_POOL_MB", 2048) as usize) << 20)
+}
+
+/// Bytes the snapshot pool holds now, and how many buffers (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn pool_held() -> (u64, usize) {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    (pool.iter().map(|v| v.capacity() as u64).sum(), pool.len())
+}
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -210,7 +231,7 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
+    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, kind: usize) -> Arc<Shadow> {
         let tracked = crate::watch::track(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
@@ -223,6 +244,14 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             marks,
+            kind,
+            used: std::sync::atomic::AtomicU64::new(clock()),
+            #[cfg(feature = "diagnostics")]
+            asked: if kind == KIND_LOOSE {
+                (0..pages(start, len).div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect()
+            } else {
+                Box::default()
+            },
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -613,6 +642,8 @@ impl Shadow {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        crate::host::mem::sub(self.kind, self.len);
         if let Some(base) = self.marks {
             let mut m = marks();
             m.owners.remove(&base);
@@ -871,7 +902,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
+        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len, KIND_WHOLE));
         changed();
     }
     entry.shadow.clone()
@@ -884,14 +915,134 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// allocations if memory use grows.
 const WINDOW: u64 = 4 << 20;
 
+/// The window loose memory is copied in (`VICTORY_LOOSE_WINDOW_KB`, a power
+/// of two from 64 to 4096; 4096 by default, [`WINDOW`]).
+fn window() -> u64 {
+    static W: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        let kb = crate::switch::number("VICTORY_LOOSE_WINDOW_KB", WINDOW >> 10);
+        if kb.is_power_of_two() && (64..=WINDOW >> 10).contains(&kb) { kb << 10 } else { WINDOW }
+    })
+}
+
+/// The end of the window copy for a lookup ending at `end`: past it by
+/// [`TAIL`] at least when windows are smaller than [`WINDOW`], since root
+/// descriptors and constant buffers are looked up by their first byte and
+/// read on from there with no bounds (past a buffer's end: device removed).
+fn window_end(end: u64, window: u64) -> u64 {
+    if window < WINDOW { (end + TAIL).next_multiple_of(window) } else { end.next_multiple_of(window) }
+}
+
+/// What a root constant buffer may read past the byte it is looked up by.
+const TAIL: u64 = 64 << 10;
+
+/// Which copy a [`Shadow`] is (`crate::host::mem`'s kinds).
+const KIND_WHOLE: usize = 0;
+const KIND_LOOSE: usize = 1;
+const KIND_VIEW: usize = 2;
+
+/// Milliseconds since the first call.
+fn clock() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Loose windows given up so far, and their bytes.
+static EVICTED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Loose windows given up so far and their bytes (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn evicted() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (EVICTED[0].load(Relaxed), EVICTED[1].load(Relaxed))
+}
+
+/// Gives up loose windows no lookup found for `VICTORY_LOOSE_IDLE_S`
+/// seconds, then the least recently found while they hold more than
+/// `VICTORY_LOOSE_CAP_MB` (both 0, off, by default). Only windows nothing
+/// else holds go: no heap slot's view, no list, no shader writes not yet
+/// copied back (`held`: how many of a copy's holders are page tables,
+/// which a window leaving lets go of at their next rewrite, [`changed`]).
+/// A window given up is copied again from title memory when a lookup next
+/// asks for it.
+///
+/// shortcut: shaders reading title memory at addresses they compute see a
+/// window given up as missing (zeros) until a lookup asks for it again.
+pub(crate) fn evict_loose(held: impl Fn(usize) -> usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let &(idle, cap) = LIMITS.get_or_init(|| {
+        (crate::switch::number("VICTORY_LOOSE_IDLE_S", 0) * 1000, crate::switch::number("VICTORY_LOOSE_CAP_MB", 0) << 20)
+    });
+    if idle == 0 && cap == 0 {
+        return;
+    }
+    let now = clock();
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let free = |s: &Arc<Shadow>| {
+        Arc::strong_count(s) == 1 + held(Arc::as_ptr(s) as usize)
+            && s.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && s.before.lock().unwrap_or_else(|e| e.into_inner()).0.is_empty()
+    };
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    if idle > 0 {
+        let old: Vec<(u64, u64)> = map
+            .iter()
+            .filter(|(_, s)| now.saturating_sub(s.used.load(Relaxed)) > idle && free(s))
+            .map(|(k, _)| *k)
+            .collect();
+        gone.extend(old.iter().filter_map(|k| map.remove(k)));
+    }
+    if cap > 0 {
+        let mut total: u64 = map.values().map(|s| s.len).sum();
+        if total > cap {
+            let mut by_use: Vec<(u64, (u64, u64))> = map.iter().filter(|(_, s)| free(s)).map(|(k, s)| (s.used.load(Relaxed), *k)).collect();
+            by_use.sort_unstable();
+            for (_, k) in by_use {
+                if total <= cap {
+                    break;
+                }
+                if let Some(s) = map.remove(&k) {
+                    total -= s.len;
+                    gone.push(s);
+                }
+            }
+        }
+    }
+    drop(map);
+    if !gone.is_empty() {
+        EVICTED[0].fetch_add(gone.len() as u64, Relaxed);
+        EVICTED[1].fetch_add(gone.iter().map(|s| s.len).sum(), Relaxed);
+        changed();
+    }
+}
+
+impl Shadow {
+    /// A lookup asked for `[address, end)` of a loose window (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    fn ask(&self, address: u64, end: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (first, last) = ((address.max(self.start) - self.start) >> 16, ((end.min(self.start + self.len)).saturating_sub(self.start + 1)) >> 16);
+        for p in first..=last.max(first) {
+            if let Some(w) = self.asked.get((p / 64) as usize) {
+                w.fetch_or(1 << (p % 64), Relaxed);
+            }
+        }
+    }
+}
+
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let window = window();
+    let start = address & !(window - 1);
+    let len = window_end(end, window) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
+        #[cfg(feature = "diagnostics")]
+        shadow.ask(address, end);
+        shadow.used.store(clock(), std::sync::atomic::Ordering::Relaxed);
         return Some(shadow.clone());
     }
     // A copy made for a wider range that holds this one serves it too (a
@@ -902,9 +1053,12 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         .range(..=(start, u64::MAX))
         .rev()
         .take(64)
-        .find(|((s, l), _)| s + l >= end)
+        .find(|((s, l), _)| s + l >= start + len)
         .map(|(_, shadow)| shadow.clone())
     {
+        #[cfg(feature = "diagnostics")]
+        shadow.ask(address, end);
+        shadow.used.store(clock(), std::sync::atomic::Ordering::Relaxed);
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -918,7 +1072,9 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         len,
         "loose memory copied to the host"
     );
-    let shadow = Shadow::new(buffer, data, gpu, start, len);
+    let shadow = Shadow::new(buffer, data, gpu, start, len, KIND_LOOSE);
+    #[cfg(feature = "diagnostics")]
+    shadow.ask(address, end);
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
@@ -949,12 +1105,18 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shad
 #[cfg(feature = "diagnostics")]
 static VIEWS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Bytes of loose copies and of title memory they cover (diagnostics):
-/// the difference is copied twice or more.
+/// Bytes of loose copies, of title memory they cover (diagnostics: the
+/// difference is copied twice or more) and of the 64 KiB pages lookups asked
+/// for in them.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn loose_coverage() -> (u64, u64) {
+pub(crate) fn loose_coverage() -> (u64, u64, u64) {
     let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (mut total, mut covered, mut reach) = (0, 0, 0);
+    let asked: u64 = map
+        .values()
+        .flat_map(|s| s.asked.iter())
+        .map(|w| u64::from(w.load(std::sync::atomic::Ordering::Relaxed).count_ones()) << 16)
+        .sum();
     for &(start, len) in map.keys() {
         total += len;
         let end = start + len;
@@ -963,7 +1125,14 @@ pub(crate) fn loose_coverage() -> (u64, u64) {
             reach = end;
         }
     }
-    (total, covered)
+    (total, covered, asked)
+}
+
+/// View copies alive now, and their bytes (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn views_live() -> (usize, u64) {
+    let guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    guard.1.values().filter_map(std::sync::Weak::upgrade).fold((0, 0), |(n, b), s| (n + 1, b + s.len))
 }
 
 /// Logs [`VIEWS`] per frame over `frames`.
@@ -1014,7 +1183,7 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Shadow::new(buffer, data, gpu, address, len);
+    let shadow = Shadow::new(buffer, data, gpu, address, len, KIND_VIEW);
     map.insert((address, len), Arc::downgrade(&shadow));
     #[cfg(feature = "diagnostics")]
     {
@@ -1068,6 +1237,17 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows smaller than the default end a root descriptor's reach past
+    /// the looked-up byte; the default keeps its old rounding.
+    #[test]
+    fn small_windows_keep_a_tail() {
+        assert_eq!(window_end(0x10_0001, WINDOW), 0x40_0000);
+        assert_eq!(window_end(0x10_0001, 1 << 20), 0x20_0000);
+        // The last 64 KiB of a 1 MiB window: the copy runs into the next.
+        assert_eq!(window_end(0xF_FF01, 1 << 20), 0x20_0000);
+        assert_eq!(window_end(0x1_0001, 64 << 10), 0x3_0000);
+    }
 
     /// The title writes a constant under a range an earlier list of the
     /// submission declared as written by shaders: the refresh before the
