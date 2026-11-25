@@ -112,6 +112,28 @@ Use the harness in `tools/lab/`: `run-probe.ps1` is the launcher and `gpumem.ps1
 - **CPU per frame in the world** (warm loop256 run, about 1,000–6,000 draws): 0.5–1.5 s preparing, of which copies 0.3–1.6 s. Refresh batches take 352 ms: copy step 186 ms, heaps 90 ms, GPU writes 77 ms, title memory 23 ms. Also heap texture uploads 70 ms, the guard handler 121 ms, state preludes 37 ms, and about 135,000 page faults. Earlier, without the limit: GPU writes 388 ms, whose snapshots were 438 MB in 310 ms.
 - **Memory still climbs in the world.** Shared memory goes from 5.2 GB to 7.5 GB in 3 minutes of intro, against a budget of about 7.6 GB. Loose copies reach 4.5 GB in about 1,000 windows, and view copies 0.8 GB in 12,500.
 - **Old texture blocker, for reference.** On Series X, before 664a0f4, v2 filled 7.6 GB dedicated and 7.2 GB shared; then a host command list failed to close with `E_OUTOFMEMORY`. At failure (d626e68 counters), textures were 9.0 GB made, of which lists had used 2.0 GB. The old branch binary used 4.5/0.8 GB dedicated/shared at the menus, against v2's 5.2/2.1 GB.
+- **Why the loops run to the cap (2026-11-25, runs `v2-dred-x`, `v2-indargs2-x`).**
+  - DRED: `f607780a` (`indirect_light_probes:CS_IrradianceCache_ShadowTrace_WithFar`, 32 threads, BVH traversal) still removes the device at loop limit 256: `0x887A0006` (DEVICE_HUNG), "a list stopped at command 53 of 69 … indirect kind 2 max 1 [compute f607780aa8e502d0]". No page fault was reported, and the title memory log missed 0 pages that frame.
+  - Effect names (`victory.exe shader-info --effects <game>/shaders.rpf` maps the 16-hex hash):
+    - `00167d58`: `WindNew:CS_CopyLatestWindFieldForRenderingWithSmooth`
+    - `8bbcbda6`, `776d835d`, `c7feccae`, `84eafa50`: `scattering_transmittance_system:CS_Gather_Classified_{2,18,0,16}`
+  - Indirect group counts after the clamp (`VICTORY_CAPTURE_WORLD=2` with `VICTORY_DUMP_TARGETS=1`) are small: 1,824 groups for `8bbcbda6` and 2,072 for `c7feccae`. So the cost is per-lane looping, not dispatch size.
+  - **The translation of the wind loops is correct.** `VICTORY_EMIT_DUMP=<dir> victory translate --list <game>/shaders.rpf` writes every emitted DXIL (25,574 files, about 4 min), and `dxc -dumpbin` reads them. The wind shader's first loop is a fixed 3 passes (`s10` from -1 up to 2), and its DXIL matches. Two other loops take their count from a raw buffer: one exits on `j+1 == count` (count at offset 0), the other on `j >= count` (count at offset 284). The buffer comes from the heap slot that cb0 reg1.x names. When it reads 0, the first runs to the cap, as in diff test "terminates on zero data". **So the cause is missing input data, not the loop translation.**
+  - **166 compute pipelines are refused with `0x80070057`** in two world frames, and 118 distinct shaders are dropped at dispatch ("no host pipeline"). Every refused one checked declares `WaveSize=64`; the RTX 4060 runs only 32-lane waves. They include:
+    - `WindNew:CS_ProjectionIteration`
+    - `shader_binning_utils:CS_GenerateShaderBinOffsets`
+    - `depth_pyramid:CS_DepthPyramid2/4`
+    - `InstanceCulling:CS_Prop/Tree_BatchCull`
+    - `GpuParticleUpdate:*`
+    - `alphaResolve` blurs
+    - `ptx_prerender`
+    - `CloudMultiScatteringCache`
+
+    Two big drops, `caa78b8ca62bc3d6` (×438) and `28918b7150a7aad5` (×219), are not in shaders.rpf. If these producers' outputs feed the looping shaders, the loops are a symptom. That is likely but **not yet proven**: check what the wind shader's count slot holds (`VICTORY_TRACE_SHADERS=00167d58cc5a78d7`) and who writes it (`VICTORY_DUMP_WRITERS`).
+  - **Census of wave64 compute:** 394 of 2,622 emitted compute shaders declare `WaveSize=64` (`lower.rs` `Lower::new`: console lanes, or one wave with LDS).
+    - 340 use wave operations. All of them use `waveReadLaneFirst` from the thread-id relabel; 97 `waveReadLaneAt`, 88 `waveActiveOp`, 37 `wavePrefixOp`, 18 `waveActiveBit`.
+    - 54 use only LDS within one wave, with no barriers.
+    - A 32-lane mode must also go into the shader cache key, as the loop limit does (read `D3D12_OPTIONS1` WaveLaneCountMin/Max).
 - **Sampler:** `powershell -File gpumem.ps1 -Name victory -Seconds N -Out file` reads the per-process "GPU Process Memory" counters every 2 s. Its source is in the session scratchpad; it is a small `Get-Counter` loop over `InstanceName -like pid_<pid>_*`.
 - **Also seen on NVIDIA:** about 25 compute pipelines refused, of which 4 ask for 64-lane waves (the RTX 4060 has 32). One `SetComputeRootSignature` comes before `SetDescriptorHeaps` with a directly indexed sampler heap.
 - **Pacing (3cc82a8):** a frame's pipeline waits share one 500 ms deadline, where each thread used to get its own. A frame wait that comes after a tick it missed ends at once.
@@ -154,7 +176,7 @@ Merge one branch at a time. After each merge, rerun the shader tests, clippy and
 ## Next steps (by impact on the goal)
 
 0. **v2: the world on this laptop.** In order:
-   - **Find why the looping compute shaders loop.** Start with `f607780aa8e502d0`, which hangs, and `00167d58cc5a78d7`. First check their shared u4 constant buffer: is it current at the dispatch? Then check a translation bug, by running the shader on WARP against a reference (`diff_tests`).
+   - **Make the refused `WaveSize=64` compute run on 32-lane NVIDIA** (see "Why the loops run to the cap"). First prove the wind and Gather loops read buffers a refused producer should have written. Then emulate 64-lane waves for those producers first: put LDS exchange at points structurisation proves group-uniform, and keep refusing elsewhere. Also look at `f607780a`'s indirect arguments, logged even when it is skipped, and gate kind-2 dispatches after a dropped compute pass.
    - **Free loose copies nobody holds**, as `exact()` does with weak entries; watch for copies being re-made. Memory runs out after about 3 minutes in the world without this.
    - **Cut CPU prep:** the copy step, heaps, the guard handler, heap texture uploads.
    - Then make buffer copies only for views that draws use.
