@@ -114,6 +114,49 @@ The old `host::mem` counters were cumulative ("made"). The new "host memory live
   - It existed before this build: `v2-viewaddr-x` (older build) crashed the same way after 2,707 ms, and `mem-B-evict` survived 2,702 ms.
   - It is a race against the watchdog. The fix is making that first submission shorter (32 lists of compute: copies, 564 ms of preparing in one frame), not memory.
 
+## Step 3: host copies of title memory (2026-11-26, builds 3be1ffe and bab0189, runs `mem-G` to `mem-X`)
+
+- **Where RAM goes at the peak (run L, 10 minutes, typeperf beside the log):**
+
+  | Item | Amount |
+  |---|---|
+  | Victory working set | 4.5 GB |
+  | Modified page list | 1.5 GB |
+  | GPU-locked system memory (the card's "system" use) | about 3.9 GB |
+  | Pools (nonpaged + paged) | about 2 GB |
+  | Paging | 8k pages/s in, 26k pages/s out |
+
+  The machine has 11.3 GB free before the game starts. Run L ran out of RAM during the world load and crashed on the title's watchdog (`+0x23cf683`) after long stalls. The largest share we control is our host copies of title memory, at 3.3–4.7 GB of locked system memory.
+- **Probes (ignored tests in `host.rs`: `evict_probe`, `in_place_probe`, `gpu_upload_probe`):**
+  - `Evict` and `MakeResident` work, and writes through a mapping still land while the buffer is evicted. Eviction does not shrink locked memory enough to matter here.
+  - `OpenExistingHeapFromAddress` works on private `VirtualAlloc2` memory, with or without `MEM_WRITE_WATCH`. It fails if any block is read-only (our guard pages), protection cannot change after opening, and it pins the whole allocation. Title pools are 2.2 GB and 1.2 GB, fully committed, so wrapping them in place would pin more than it saves.
+  - The GPU upload heap (ReBAR) is supported on this RTX 4060. CPU writes run at 2.7 GB/s and reads at 22 MB/s.
+- **Census (`shadow::backing`, `shadow::held`):** loose windows lie mostly over the title's mapped page-pool views. Most title buffers are made with unordered access (flag 0x4). About 700 MB of buffer copies are written by shaders.
+- **What changed:**
+  - **Loose windows (3be1ffe):** 64 KiB windows (`VICTORY_LOOSE_WINDOW_KB=64`), windows given up when idle (`VICTORY_LOOSE_IDLE_S=20`), and free windows a larger one covers are let go ("superseded"). Loose windows dropped from about 2.7 GB to 1.0–1.5 GB.
+  - **Bounded lookups (bab0189):** constant, vertex, index and view-copy lookups ask only for their range, with no 64 KiB tail. Live loose bytes are now about 1.08× the bytes asked for.
+  - **Copies in video memory (bab0189, `VICTORY_COPIES_IN_VIDEO=1`, opt-in):** copies of buffers made without unordered access, and loose windows, go in the GPU upload heap. When the budget leaves less than 512 MiB, they go in system memory as before.
+    - A copy that shaders turn out to write is made again in system memory, because copy-back would read it at 22 MB/s. Its pages are remembered, so later windows over them start in system memory.
+    - Title slots that view the old copy are made again before the next submission (`HostHeap::take_demoted`, matched by buffer).
+    - Unordered views and root UAVs take system memory from the start.
+  - **Buffer idle release (`VICTORY_BUFFER_IDLE_S`, opt-in):** it released nothing. Every idle buffer copy is still held by a slot or a page table.
+- **Results, 5 minutes each, still loading at the end (64 KiB windows, idle 20 s, snapshot pool 512 MiB):**
+
+  | Run | Card system memory | Copying back per frame | Stalls | Crash |
+  |---|---|---|---|---|
+  | K, M, N, P (copies in system memory) | 3.3–4.7 GB | 17–85 ms | several | none |
+  | Q (video memory, no demotion) | 2.1–2.7 GB | about 172 ms | | none |
+  | R (demotion, 5 copies) | 1.6–2.5 GB | 157–183 ms | 11 s, 4 s | none |
+  | X (demotion and stale slots made again) | 2.1–2.7 GB | 18–47 ms | 6 s, 4 s | none |
+
+  - Runs R to W were spent tracing why demotion did not help. The remaining reads were all on the marked-view path, from title slots made before the demotion. Those slots keep only the copy's buffer, so a check on the copy itself missed them.
+  - In run X, copy-backs read video memory almost never: 0–5 pages per 15 s, against about 50 a frame before.
+- **Still not good enough:** at the peak, RAM available still falls to 400–800 MB, and commit grows to 44 of 46 GB as the pagefile grows. The loading screen runs at 29–30 fps, then 0.5–1.5 fps during the load itself. No 5-minute run reached the world.
+- **Next for RAM:**
+  - About 1.18 GB of whole buffer copies (3,460), most of them made with unordered access. For those, keep the copy in video memory and read back only on demand, with a GPU copy to a readback buffer instead of CPU reads.
+  - View copies.
+  - Use tracking from the GPU side, so that windows that are idle but still held by a page table can be let go.
+
 ## More references (from the user's research agents, 2026-11-26; checked only where noted)
 - **fxceless's fork (its pushed main, GPL-3.0; reviewed in part):** `resource.rs` `room()` and `let_go_idle()`, a texture budget from `QueryVideoMemoryInfo` with a 2 GiB floor, at 90 % of budget. It sweeps idle textures the title fills and the host never wrote, if no list or slot holds them. Also `texture.rs` `let_go_idle` for staging, `HostHeap::texture_slot_gone`, a snapshot pool capped at 512 MiB, `VICTORY_WINDOW_KB`/`VICTORY_WINDOW_TAILS`, and card buffers. Reported to carry an RTX 3050 8 GB for 90 minutes at 1–3 fps with a large pagefile.
 - **XCL (GPL-2.0-only; ideas only, see below):** a self-sizing coherent heap with its size remembered between runs (`cache/uma_coherent.txt`), sparse VRAM windows through `UpdateTileMappings`, and batched write-watch.
