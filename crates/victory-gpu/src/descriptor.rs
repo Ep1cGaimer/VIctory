@@ -171,6 +171,10 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        // Slots viewing a copy made again in system memory.
+        for index in host.take_demoted() {
+            host.mirror(index, start + u64::from(index) * step, false);
+        }
         for (from, to) in written.take(start as usize, usize::MAX) {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.

@@ -483,7 +483,7 @@ impl State {
             if v.address == 0 || v.size == 0 {
                 continue;
             }
-            let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
+            let Some(shadow) = crate::shadow::find_bounded(v.address, u64::from(v.size)) else {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -501,7 +501,7 @@ impl State {
         }
         if indexed {
             let v = self.index;
-            let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
+            let Some(shadow) = crate::shadow::find_bounded(v.address, u64::from(v.size)) else {
                 not_run("index buffer outside title buffers");
                 return false;
             };
@@ -822,7 +822,8 @@ impl State {
             once!(slot, "a shader reads a root view the title did not set: dropped");
             return None;
         };
-        let shadow = crate::shadow::find(address, 1)?;
+        // A copy shaders write is in system memory (copy-back reads it).
+        let shadow = if uav { crate::shadow::find_root_writable(address)? } else { crate::shadow::find(address, 1)? };
         let offset = u32::try_from(shadow.offset(address)).ok()?;
         shadow.refresh(list, address, shadow.left(address));
         if uav {

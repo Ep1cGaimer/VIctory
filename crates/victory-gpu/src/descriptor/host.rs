@@ -57,6 +57,8 @@ pub(crate) struct HostHeap {
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
+    /// [`crate::shadow::demotions`] when [`Self::take_demoted`] last looked.
+    demotions: std::sync::atomic::AtomicU64,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -267,6 +269,7 @@ impl HostHeap {
             marks,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
+            demotions: std::sync::atomic::AtomicU64::new(0),
         };
         if !sampler {
             crate::bindless::register(&h.viewed);
@@ -609,6 +612,32 @@ impl HostHeap {
         }
     }
 
+    /// Title slots whose view's copy was made again in system memory since
+    /// the heap last looked ([`crate::shadow::demotions`]): marked unmade,
+    /// for the caller to mirror again. Shaders writing through such a view
+    /// would write the copy in video memory, which copy-back reads at a
+    /// few MB/s.
+    pub(crate) fn take_demoted(&self) -> Vec<u32> {
+        let now = crate::shadow::demotions();
+        if self.sampler || self.demotions.swap(now, std::sync::atomic::Ordering::AcqRel) == now {
+            return Vec::new();
+        }
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let stale: Vec<u32> = kept
+            .iter()
+            .take(self.count as usize)
+            .enumerate()
+            .filter(|(_, k)| k.as_ref().is_some_and(|k| crate::shadow::is_demoted_buffer(&k.0)))
+            .map(|(i, _)| i as u32)
+            .collect();
+        drop(kept);
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        for &i in &stale {
+            made[i as usize] = 0;
+        }
+        stale
+    }
+
     /// The host address of the slots' view addresses (see the field), made
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
@@ -948,7 +977,8 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let writes = matches!(view, View::Unordered(..) | View::Placed(true, ..));
+    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)), writes)?;
     Some((shadow, address, len))
 }
 
@@ -995,7 +1025,7 @@ fn buffer_srv(
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
     let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
+        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element, false)
     else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
@@ -1059,7 +1089,7 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element, true)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -1233,7 +1263,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             // (`victory_shader::emit`, "Constant buffers in the heap"): the
             // console needs 16-byte alignment, a host constant buffer view
             // 256, which most of the title's do not have on the host.
-            let shadow = crate::shadow::find(address, u64::from(size))?;
+            let shadow = crate::shadow::find_bounded(address, u64::from(size))?;
             let bytes = u64::from(size).min(shadow.left(address));
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,

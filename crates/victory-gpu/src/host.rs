@@ -485,6 +485,67 @@ mod tests {
         state("released");
     }
 
+    /// Probe: whether the card offers CPU-visible video memory (GPU upload
+    /// heaps, resizable BAR), where copies of title memory the GPU only
+    /// reads could live instead of system memory.
+    #[test]
+    #[ignore = "uses the GPU; a measurement"]
+    fn gpu_upload_probe() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let host = super::host().expect("a host device");
+        let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        // SAFETY: a sized structure for its feature.
+        let r = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS16,
+                (&raw mut o16).cast(),
+                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS16>() as u32,
+            )
+        };
+        println!("options16: {r:?}, GPU upload heaps {:?}", o16.GPUUploadHeapSupported);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 64 << 20,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        let made = unsafe {
+            host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+        };
+        let (local, _, other) = super::video_memory().unwrap_or_default();
+        println!("GPU upload buffer of 64 MB: {made:?}; card local {} MB, system {} MB", local >> 20, other >> 20);
+        if let Some(b) = &buffer {
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a live buffer.
+            let mapped = unsafe { b.Map(0, None, Some(&mut data)) };
+            println!("map: {mapped:?}");
+            if mapped.is_ok() {
+                let src = vec![7u8; 64 << 20];
+                let started = std::time::Instant::now();
+                // SAFETY: a mapping of 64 MB.
+                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), data.cast::<u8>(), src.len()) };
+                let w = started.elapsed().as_secs_f64();
+                let mut back = vec![0u8; 4 << 20];
+                let started = std::time::Instant::now();
+                // SAFETY: as above.
+                unsafe { std::ptr::copy_nonoverlapping(data.cast::<u8>(), back.as_mut_ptr(), back.len()) };
+                std::hint::black_box(&back);
+                let r = started.elapsed().as_secs_f64();
+                println!("CPU write {:.0} MB/s, read {:.0} MB/s (check {})", 64.0 / w, 4.0 / r, back[12345]);
+            }
+        }
+    }
+
     /// Probe: whether the GPU can be given the title's write-watched private
     /// memory in place (`OpenExistingHeapFromAddress`), with some of its
     /// blocks read-only as change tracking leaves them, and what it pins.
@@ -3098,6 +3159,72 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    /// A buffer in video memory the CPU writes through the resizable BAR (a
+    /// GPU upload heap: ~2.7 GB/s written, ~20 MB/s read back), for copies
+    /// of title memory shaders only read (loose windows, buffers made
+    /// without unordered access): system memory they would pin is what the
+    /// title's own pages page out for. `VICTORY_COPIES_IN_VIDEO`
+    /// (0, off, by default); None where the card has no such heap or video
+    /// memory would come within 512 MiB of its budget.
+    pub(crate) fn video_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| {
+            if crate::switch::number("VICTORY_COPIES_IN_VIDEO", 0) == 0 {
+                return false;
+            }
+            let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: a sized structure for its feature.
+            let asked = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut o16).cast(),
+                    size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS16>() as u32,
+                )
+            };
+            let ok = asked.is_ok() && o16.GPUUploadHeapSupported.as_bool();
+            tracing::info!(ok, "copies of read-only title buffers in video memory");
+            ok
+        });
+        if !on {
+            return None;
+        }
+        let (used, budget, _) = video_memory()?;
+        if used + size + (512 << 20) > budget {
+            return None;
+        }
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        unsafe {
+            self.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+                .ok()?;
+        }
+        Some((buffer?, data.cast()))
+    }
+
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
@@ -3747,6 +3874,10 @@ pub(crate) mod mem {
         let (pool, pooled) = crate::shadow::pool_held();
         let (evicted, evicted_bytes) = crate::shadow::evicted();
         let (superseded, superseded_bytes) = crate::shadow::superseded();
+        let video = crate::shadow::in_video();
+        let demoted = crate::shadow::demoted();
+        tracing::info!("copy-backs reading video memory (page tables, declared, marked views; by whole, loose, view): {:?}", crate::shadow::video_reads());
+        let (released, released_bytes) = crate::shadow::released();
         let (commit, working) = process_memory();
         let (avail, total, system_commit, limit) = system_memory();
         tracing::info!(
@@ -3757,9 +3888,11 @@ pub(crate) mod mem {
             mb(limit)
         );
         tracing::info!(
-            "host memory live: buffer copies {:.0} MB ({nw}), loose windows {:.0} MB ({nl}; lookups asked for {:.0} MB of their pages; {evicted} given up, {:.0} MB; {superseded} superseded, {:.0} MB), \
+            "host memory live: buffer copies {:.0} MB ({nw}; {released} given up, {:.0} MB; buffer and loose copies in video memory {:.0} MB, {demoted} made again in system memory), loose windows {:.0} MB ({nl}; lookups asked for {:.0} MB of their pages; {evicted} given up, {:.0} MB; {superseded} superseded, {:.0} MB), \
              view copies {:.0} MB ({nv}; {exact} found, {:.0} MB); snapshot pool {:.0} MB ({pooled}); process commit {:.0} MB, working set {:.0} MB",
             mb(whole),
+            mb(released_bytes),
+            mb(video),
             mb(windows),
             mb(asked),
             mb(evicted_bytes),
@@ -3776,6 +3909,11 @@ pub(crate) mod mem {
             if now >= LAST.load(Relaxed) + 30_000 {
                 LAST.store(now, Relaxed);
                 tracing::info!("title memory under host copies: {}", crate::shadow::backing());
+                let h = crate::shadow::held();
+                tracing::info!(
+                    "host copies by use: buffers idle and free {:.0} MB, idle but held {:.0} MB, lately used {:.0} MB, shaders write {:.0} MB; loose windows {:.0}, {:.0}, {:.0}, {:.0} MB",
+                    mb(h[0][0]), mb(h[0][1]), mb(h[0][2]), mb(h[0][3]), mb(h[1][0]), mb(h[1][1]), mb(h[1][2]), mb(h[1][3])
+                );
             }
         }
         let (census, (gone, gone_bytes), (targets, spans, distinct)) = crate::resource::census();

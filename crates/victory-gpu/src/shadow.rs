@@ -50,6 +50,14 @@ pub(crate) struct Shadow {
     /// window or view copy), for the live-memory counts.
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     kind: usize,
+    /// It lives in video memory: the CPU writes it, reading it back is
+    /// slow (~20 MB/s).
+    video: std::sync::atomic::AtomicBool,
+    /// Made again in system memory after shaders wrote it ([`Shadow::written_on_gpu`]).
+    demoted: std::sync::atomic::AtomicBool,
+    /// Shaders were declared to write it (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    gpu_written: std::sync::atomic::AtomicBool,
     /// When a lookup last found it (loose windows), ms on [`clock`].
     used: std::sync::atomic::AtomicU64,
     /// Loose windows (diagnostics): the 64 KiB pages lookups asked for, a
@@ -189,6 +197,9 @@ impl Shadow {
     // shortcut: a page the copy holds only in part (at its ends) has no
     // "copied" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
+        self.written_on_gpu();
+        #[cfg(feature = "diagnostics")]
+        self.count_video_read(0);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
@@ -245,6 +256,10 @@ impl Shadow {
             before: Mutex::default(),
             marks,
             kind,
+            video: std::sync::atomic::AtomicBool::new(false),
+            demoted: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "diagnostics")]
+            gpu_written: std::sync::atomic::AtomicBool::new(false),
             used: std::sync::atomic::AtomicU64::new(clock()),
             #[cfg(feature = "diagnostics")]
             asked: if kind == KIND_LOOSE {
@@ -297,6 +312,8 @@ impl Shadow {
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         let len = len.min(self.left(address));
+        #[cfg(feature = "diagnostics")]
+        self.gpu_written.store(true, std::sync::atomic::Ordering::Relaxed);
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
     }
 
@@ -366,6 +383,9 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        self.written_on_gpu();
+        #[cfg(feature = "diagnostics")]
+        self.count_video_read(1);
         self.copy_back_or_not(address, len, true)
     }
 
@@ -468,6 +488,9 @@ impl Shadow {
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
     pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+        self.written_on_gpu();
+        #[cfg(feature = "diagnostics")]
+        self.count_video_read(2);
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -640,8 +663,138 @@ impl Shadow {
     }
 }
 
+impl Shadow {
+    /// Shaders wrote this copy (copy-back is about to compare it). One in
+    /// video memory reads back slowly (~20 MB/s; written loose windows cost
+    /// ~170 ms a frame), so it is made again in system memory: its pages
+    /// are remembered as written (copies of them are not put in video
+    /// memory again) and a system-memory copy of the same range takes its
+    /// place where lookups and page tables find it, filled from title memory
+    /// (where this copy-back puts what the GPU wrote) at its first refresh.
+    /// Views made from this one keep it until they go.
+    fn written_on_gpu(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.video.load(Relaxed) || self.demoted.swap(true, Relaxed) {
+            return;
+        }
+        {
+            let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            w.extend((self.start >> 16)..=((self.start + self.len.max(1) - 1) >> 16));
+        }
+        DEMOTED_BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).insert(windows::core::Interface::as_raw(&self.buffer) as usize);
+        DEMOTED.fetch_add(1, Relaxed);
+        let Some(host) = host() else { return };
+        let make = |kind: usize| {
+            let (buffer, data) = host.shared_buffer(self.len.next_multiple_of(1 << 16))?;
+            #[cfg(feature = "diagnostics")]
+            crate::host::mem::add(kind, self.len);
+            crate::host::name(&buffer, || format!("title memory {:#x}+{:#x} (written by shaders)", self.start, self.len));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            Some(Shadow::new(buffer, data, gpu, self.start, self.len, kind))
+        };
+        let me = |s: &Arc<Shadow>| std::ptr::eq(Arc::as_ptr(s), self);
+        if self.kind == KIND_LOOSE {
+            let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            if map.get(&(self.start, self.len)).is_some_and(me)
+                && let Some(s) = make(KIND_LOOSE)
+            {
+                map.insert((self.start, self.len), s);
+                changed();
+            }
+        } else if self.kind == KIND_WHOLE {
+            let mut map = buffers();
+            if let Some(e) = map.values_mut().find(|e| e.shadow.as_ref().is_some_and(me)) {
+                e.read_only = false;
+                if let Some(s) = make(KIND_WHOLE) {
+                    e.shadow = Some(s);
+                    changed();
+                }
+            }
+        }
+    }
+}
+
+impl Shadow {
+    /// Copy-back of a copy in video memory (diagnostics): by path (page
+    /// tables, declared ranges, marked views) and kind.
+    #[cfg(feature = "diagnostics")]
+    fn count_video_read(&self, path: usize) {
+        if self.video.load(std::sync::atomic::Ordering::Relaxed) {
+            let n = VIDEO_READS[path * 3 + self.kind.min(2)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if n % 50 == 0 && LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                let in_map = if self.kind == KIND_LOOSE {
+                    LOOSE.lock().unwrap_or_else(|e| e.into_inner()).get(&(self.start, self.len)).map(|s| std::ptr::eq(Arc::as_ptr(s), self))
+                } else {
+                    None
+                };
+                tracing::warn!(
+                    path,
+                    kind = self.kind,
+                    start = format_args!("{:#x}", self.start),
+                    len = self.len,
+                    demoted = self.demoted.load(std::sync::atomic::Ordering::Relaxed),
+                    ?in_map,
+                    "copy-back reads a copy in video memory"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static VIDEO_READS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// [`VIDEO_READS`] since the last call.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn video_reads() -> [u64; 9] {
+    std::array::from_fn(|i| VIDEO_READS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Title pages (64 KiB numbers) shaders wrote through a copy in video
+/// memory: copies of them stay in system memory.
+static WRITTEN: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Copies in video memory made again in system memory.
+static DEMOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Copies made again in system memory so far: slots viewing one of them
+/// are made again (`crate::descriptor::sync_heaps`).
+pub(crate) fn demotions() -> u64 {
+    DEMOTED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The buffers of copies made again in system memory (raw pointers): a
+/// slot whose view is of one is stale. (One released and its address
+/// reused only makes a slot again needlessly.)
+static DEMOTED_BUFFERS: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether `buffer` is the buffer of a copy made again in system memory.
+pub(crate) fn is_demoted_buffer(buffer: &ID3D12Resource) -> bool {
+    DEMOTED_BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).contains(&(windows::core::Interface::as_raw(buffer) as usize))
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn demoted() -> u64 {
+    DEMOTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether shaders wrote any of `[start, start + len)` through a copy in video memory.
+fn written_pages(start: u64, len: u64) -> bool {
+    WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range((start >> 16)..=((start + len.max(1) - 1) >> 16))
+        .next()
+        .is_some()
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if *self.video.get_mut() {
+            VIDEO.fetch_sub(self.len, std::sync::atomic::Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         crate::host::mem::sub(self.kind, self.len);
         if let Some(base) = self.marks {
@@ -823,6 +976,10 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
+    /// The title made it without unordered access: shaders only read it,
+    /// so its copy may live in video memory the CPU writes but never
+    /// reads ([`crate::host::Host::video_buffer`]).
+    read_only: bool,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -852,6 +1009,19 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
         Entry {
             end: start + len,
             shadow: None,
+            read_only: false,
+        },
+    );
+}
+
+/// [`register`] for a buffer the title made without unordered access.
+pub(crate) fn register_read_only(resource: usize, start: u64, len: u64) {
+    buffers().insert(
+        (start, resource),
+        Entry {
+            end: start + len,
+            shadow: None,
+            read_only: true,
         },
     );
 }
@@ -866,6 +1036,39 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_in(address, len, true, false)
+}
+
+/// [`find`] for a view whose bounds the host checks (buffer views, vertex
+/// and index buffers): outside title buffers its copy need not reach past
+/// `len` ([`TAIL`]; with 64 KiB windows a tail page each was a third of
+/// loose copy memory).
+pub(crate) fn find_bounded(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_in(address, len, false, false)
+}
+
+/// [`find_bounded`] for a view shaders write (unordered access): its copy
+/// is in system memory, where copy-back reads it (one in video memory is
+/// made again there first, [`Shadow::written_on_gpu`]).
+pub(crate) fn find_writable(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    writable(address, len, false)
+}
+
+/// [`find`] for a root view shaders write.
+pub(crate) fn find_root_writable(address: u64) -> Option<Arc<Shadow>> {
+    writable(address, 1, true)
+}
+
+fn writable(address: u64, len: u64, tail: bool) -> Option<Arc<Shadow>> {
+    let found = find_in(address, len, tail, true)?;
+    if !found.video.load(std::sync::atomic::Ordering::Relaxed) {
+        return Some(found);
+    }
+    found.written_on_gpu();
+    find_in(address, len, tail, true)
+}
+
+fn find_in(address: u64, len: u64, tail: bool, writes: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -876,14 +1079,24 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end);
+        return loose(address, end, tail, writes);
     };
     let entry = map.get_mut(&key)?;
+    if let Some(s) = &entry.shadow {
+        s.used.store(clock(), std::sync::atomic::Ordering::Relaxed);
+    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        let size = len.next_multiple_of(1 << 16);
+        let host = host()?;
+        let video = if entry.read_only && !writes { host.video_buffer(size) } else { None };
+        let in_video = video.is_some();
+        let (buffer, data) = match video {
+            Some(made) => made,
+            None => host.shared_buffer(size)?,
+        };
         #[cfg(feature = "diagnostics")]
         crate::host::mem::add(crate::host::mem::WHOLE, len);
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
@@ -902,7 +1115,12 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len, KIND_WHOLE));
+        let shadow = Shadow::new(buffer, data, gpu, key.0, len, KIND_WHOLE);
+        if in_video {
+            shadow.video.store(true, std::sync::atomic::Ordering::Relaxed);
+            VIDEO.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+        }
+        entry.shadow = Some(shadow);
         changed();
     }
     entry.shadow.clone()
@@ -929,8 +1147,8 @@ fn window() -> u64 {
 /// [`TAIL`] at least when windows are smaller than [`WINDOW`], since root
 /// descriptors and constant buffers are looked up by their first byte and
 /// read on from there with no bounds (past a buffer's end: device removed).
-fn window_end(end: u64, window: u64) -> u64 {
-    if window < WINDOW { (end + TAIL).next_multiple_of(window) } else { end.next_multiple_of(window) }
+fn window_end(end: u64, window: u64, tail: bool) -> u64 {
+    if tail && window < WINDOW { (end + TAIL).next_multiple_of(window) } else { end.next_multiple_of(window) }
 }
 
 /// What a root constant buffer may read past the byte it is looked up by.
@@ -955,6 +1173,34 @@ static EVICTED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::
 pub(crate) fn evicted() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (EVICTED[0].load(Relaxed), EVICTED[1].load(Relaxed))
+}
+
+/// [`evict_loose`]'s census (diagnostics).
+#[cfg(feature = "diagnostics")]
+static HELD: Mutex<[[u64; 4]; 2]> = Mutex::new([[0; 4]; 2]);
+
+/// Copy bytes, buffers then loose windows: idle and free, idle but held,
+/// lately used; and of all of them, those shaders write.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn held() -> [[u64; 4]; 2] {
+    *HELD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bytes of buffer copies living in video memory.
+static VIDEO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn in_video() -> u64 {
+    VIDEO.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Buffer copies given up idle (count, bytes).
+static RELEASED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn released() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (RELEASED[0].load(Relaxed), RELEASED[1].load(Relaxed))
 }
 
 /// Loose windows let go of because a wider one holds them (count, bytes).
@@ -1019,6 +1265,56 @@ pub(crate) fn evict_loose(held: impl Fn(usize) -> usize) {
         }
         gone.clear();
     }
+    // Copies of title buffers no lookup found for `VICTORY_BUFFER_IDLE_S`
+    // seconds (0, off, by default) go the same way: made again from title
+    // memory when a lookup next asks (most of the world's 1.2 GB of buffer
+    // copies serve its load only).
+    static BUFFER_IDLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let buffer_idle = *BUFFER_IDLE.get_or_init(|| crate::switch::number("VICTORY_BUFFER_IDLE_S", 0) * 1000);
+    // Diagnostics: copies by how they are held and how long unused (20 s
+    // when no idle limit is set): idle and free, idle but held by more than
+    // page tables (views, lists), lately used; buffers then loose windows.
+    #[cfg(feature = "diagnostics")]
+    {
+        let limit = if buffer_idle > 0 { buffer_idle } else { 20_000 };
+        let mut c = [[0u64; 4]; 2];
+        let mut count = |row: usize, s: &Arc<Shadow>| {
+            if s.gpu_written.load(Relaxed) {
+                c[row][3] += s.len;
+            }
+            let col = if now.saturating_sub(s.used.load(Relaxed)) <= limit {
+                2
+            } else if free(s) {
+                0
+            } else {
+                1
+            };
+            c[row][col] += s.len;
+        };
+        for s in buffers().values().filter_map(|e| e.shadow.as_ref()) {
+            count(0, s);
+        }
+        for s in map.values() {
+            count(1, s);
+        }
+        *HELD.lock().unwrap_or_else(|e| e.into_inner()) = c;
+    }
+    if buffer_idle > 0 {
+        let mut released: Vec<Arc<Shadow>> = Vec::new();
+        {
+            let mut buffers = buffers();
+            for e in buffers.values_mut() {
+                if e.shadow.as_ref().is_some_and(|s| now.saturating_sub(s.used.load(Relaxed)) > buffer_idle && free(s)) {
+                    released.extend(e.shadow.take());
+                }
+            }
+        }
+        if !released.is_empty() {
+            RELEASED[0].fetch_add(released.len() as u64, Relaxed);
+            RELEASED[1].fetch_add(released.iter().map(|s| s.len).sum(), Relaxed);
+            changed();
+        }
+    }
     if idle == 0 && cap == 0 {
         return;
     }
@@ -1071,10 +1367,10 @@ impl Shadow {
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
-fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
+fn loose(address: u64, end: u64, tail: bool, writes: bool) -> Option<Arc<Shadow>> {
     let window = window();
     let start = address & !(window - 1);
-    let len = window_end(end, window) - start;
+    let len = window_end(end, window, tail) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         #[cfg(feature = "diagnostics")]
@@ -1098,7 +1394,15 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         shadow.used.store(clock(), std::sync::atomic::Ordering::Relaxed);
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    // Shaders only read loose memory (none wrote any of the 1.0-1.5 GB of
+    // windows in the world's load): in video memory while it has room.
+    let host = host()?;
+    let video = if writes || written_pages(start, len) { None } else { host.video_buffer(len) };
+    let in_video = video.is_some();
+    let (buffer, data) = match video {
+        Some(made) => made,
+        None => host.shared_buffer(len)?,
+    };
     #[cfg(feature = "diagnostics")]
     crate::host::mem::add(crate::host::mem::LOOSE, len);
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -1110,6 +1414,10 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len, KIND_LOOSE);
+    if in_video {
+        shadow.video.store(true, std::sync::atomic::Ordering::Relaxed);
+        VIDEO.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+    }
     #[cfg(feature = "diagnostics")]
     shadow.ask(address, end);
     map.insert((start, len), shadow.clone());
@@ -1127,8 +1435,8 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// culled). Such a view gets a copy of its own bytes, starting at its
 /// address (`true` with it), which lives while a heap slot made from the
 /// view or a list holds it.
-pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shadow>, bool)> {
-    let shadow = find(address, len)?;
+pub(crate) fn for_view(address: u64, len: u64, element: u64, writes: bool) -> Option<(Arc<Shadow>, bool)> {
+    let shadow = if writes { find_writable(address, len)? } else { find_bounded(address, len)? };
     if element == 0 || shadow.offset(address).is_multiple_of(element) {
         return Some((shadow, false));
     }
@@ -1346,11 +1654,13 @@ mod tests {
     /// the looked-up byte; the default keeps its old rounding.
     #[test]
     fn small_windows_keep_a_tail() {
-        assert_eq!(window_end(0x10_0001, WINDOW), 0x40_0000);
-        assert_eq!(window_end(0x10_0001, 1 << 20), 0x20_0000);
+        assert_eq!(window_end(0x10_0001, WINDOW, true), 0x40_0000);
+        assert_eq!(window_end(0x10_0001, 1 << 20, true), 0x20_0000);
         // The last 64 KiB of a 1 MiB window: the copy runs into the next.
-        assert_eq!(window_end(0xF_FF01, 1 << 20), 0x20_0000);
-        assert_eq!(window_end(0x1_0001, 64 << 10), 0x3_0000);
+        assert_eq!(window_end(0xF_FF01, 1 << 20, true), 0x20_0000);
+        assert_eq!(window_end(0x1_0001, 64 << 10, true), 0x3_0000);
+        // Bounded views: no tail.
+        assert_eq!(window_end(0x1_0001, 64 << 10, false), 0x2_0000);
     }
 
     /// The title writes a constant under a range an earlier list of the

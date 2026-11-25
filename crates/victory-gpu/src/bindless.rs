@@ -161,7 +161,7 @@ fn seen(view: &View) -> Option<Seen> {
     let (shadow, address, len) = match *view {
         View::Constant(address, size) => {
             let len = u64::from(size);
-            ((len > 0).then(|| crate::shadow::find(address, len)).flatten()?, address, len)
+            ((len > 0).then(|| crate::shadow::find_bounded(address, len)).flatten()?, address, len)
         }
         _ => crate::descriptor::host::view_copy(view)?,
     };
