@@ -842,6 +842,8 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        #[cfg(feature = "diagnostics")]
+        crate::host::mem::add(crate::host::mem::WHOLE, len);
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -881,7 +883,22 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
+    // A copy made for a wider range that holds this one serves it too (a
+    // range across two windows made a third copy of both, and in the world
+    // loose copies grew by gigabytes). Copies start on window boundaries,
+    // so one holding `[address, end)` starts at or below `start`.
+    if let Some(shadow) = map
+        .range(..=(start, u64::MAX))
+        .rev()
+        .take(64)
+        .find(|((s, l), _)| s + l >= end)
+        .map(|(_, shadow)| shadow.clone())
+    {
+        return Some(shadow);
+    }
     let (buffer, data) = host()?.shared_buffer(len)?;
+    #[cfg(feature = "diagnostics")]
+    crate::host::mem::add(crate::host::mem::LOOSE, len);
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -920,6 +937,23 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shad
 /// copies' bytes and the largest (diagnostics).
 #[cfg(feature = "diagnostics")]
 static VIEWS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Bytes of loose copies and of title memory they cover (diagnostics):
+/// the difference is copied twice or more.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn loose_coverage() -> (u64, u64) {
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut total, mut covered, mut reach) = (0, 0, 0);
+    for &(start, len) in map.keys() {
+        total += len;
+        let end = start + len;
+        if end > reach {
+            covered += end - start.max(reach);
+            reach = end;
+        }
+    }
+    (total, covered)
+}
 
 /// Logs [`VIEWS`] per frame over `frames`.
 #[cfg(feature = "diagnostics")]
@@ -964,6 +998,8 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         *prune_at = (2 * map.len()).max(1024);
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    #[cfg(feature = "diagnostics")]
+    crate::host::mem::add(crate::host::mem::VIEW, len);
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };

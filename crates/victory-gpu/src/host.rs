@@ -909,6 +909,8 @@ impl Host {
             let prelude_allocator: ID3D12CommandAllocator = self
                 .device
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            #[cfg(feature = "diagnostics")]
+            mem::add(mem::LISTS, 0);
             let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
                 0,
                 D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -2401,6 +2403,10 @@ impl Host {
                 &mut buffer,
             )
         };
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok() {
+            mem::add(mem::DEFAULT, size);
+        }
         made.ok().and(buffer)
     }
 
@@ -2440,6 +2446,10 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok() {
+            mem::add(mem::UPLOAD, size);
+        }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
@@ -2596,6 +2606,7 @@ impl Meter {
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
+                mem::log();
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -2916,6 +2927,10 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok() {
+            mem::add(mem::SHARED, size);
+        }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
@@ -3247,6 +3262,62 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
              before {n_before} hashes in {before:?}, after {n_after} in {after:?} ({:.1}x)",
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
+        );
+    }
+}
+
+/// Host memory made so far, by kind (diagnostics): bytes as placed (a
+/// committed resource takes 64 KB at least) and how many. Made, not live:
+/// what grows is what to look at.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod mem {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub(crate) const WHOLE: usize = 0;
+    pub(crate) const LOOSE: usize = 1;
+    pub(crate) const VIEW: usize = 2;
+    pub(crate) const SHARED: usize = 3;
+    pub(crate) const UPLOAD: usize = 4;
+    pub(crate) const DEFAULT: usize = 5;
+    pub(crate) const TEXTURE: usize = 6;
+    pub(crate) const TWIN: usize = 7;
+    pub(crate) const LISTS: usize = 8;
+    const NAMES: [&str; 9] = [
+        "shared: buffer copies",
+        "shared: loose windows",
+        "shared: view copies",
+        "shared: all",
+        "upload",
+        "default buffers",
+        "textures",
+        "depth twins",
+        "command lists",
+    ];
+    static BYTES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+    static COUNT: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+    pub(crate) fn add(kind: usize, bytes: u64) {
+        BYTES[kind].fetch_add(bytes.next_multiple_of(1 << 16), Relaxed);
+        COUNT[kind].fetch_add(1, Relaxed);
+    }
+
+    /// The size `resource` takes, as the host places it.
+    pub(crate) fn placed(resource: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u64 {
+        let Some(host) = super::host() else { return 0 };
+        // SAFETY: a live resource and device.
+        unsafe { host.device.GetResourceAllocationInfo(0, &[resource.GetDesc()]).SizeInBytes }
+    }
+
+    pub(crate) fn log() {
+        let parts: Vec<String> = (0..NAMES.len())
+            .map(|i| format!("{} {:.0} MB ({})", NAMES[i], BYTES[i].load(Relaxed) as f64 / 1048576.0, COUNT[i].load(Relaxed)))
+            .collect();
+        let (loose, covered) = crate::shadow::loose_coverage();
+        tracing::info!(
+            "host memory made: {}; loose copies live {:.0} MB covering {:.0} MB",
+            parts.join(", "),
+            loose as f64 / 1048576.0,
+            covered as f64 / 1048576.0
         );
     }
 }

@@ -138,6 +138,8 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
             return None;
         }
         let texture = texture?;
+        #[cfg(feature = "diagnostics")]
+        crate::host::mem::add(crate::host::mem::TWIN, crate::host::mem::placed(&texture));
         crate::host::name(&texture, || format!("depth twin {}x{} f{f}", dd.Width, dd.Height));
         planes.push(Arc::new(HostTexture::new(texture, 0, Vec::new())));
     }

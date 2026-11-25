@@ -1513,6 +1513,8 @@ fn make_texture(
         }
     }
     let texture = texture?;
+    #[cfg(feature = "diagnostics")]
+    crate::host::mem::add(crate::host::mem::TEXTURE, crate::host::mem::placed(&texture));
     crate::host::name(&texture, || {
         // Its address, for the lifetime notes (`life`) of a freed one.
         format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
