@@ -793,7 +793,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn fixed_table_slots_use_compact_dynamic_ranges() {
+    fn fixed_table_slots_inside_the_host_heap_need_no_fresh_table() {
         use victory_shader::{ResourceType, RootType, UsedResource, emit::UserData};
         let Some(host) = crate::host::host() else {
             eprintln!("no D3D12 device; skipped");
@@ -814,20 +814,14 @@ mod tests {
         let mut binding = [UserData {
             index: 0, slot: 0, root: RootType::Table, dword: 0, table_slots: Some((511, 511)),
         }];
-        let cb = [0u32; 64];
-        let address = cb.as_ptr() as u64;
-        create_cbv(std::ptr::null(), &[address as u32, (address >> 32) as u32, 256, 0],
-            table + 511 * 32);
-        let first = state.tables(&list, &used, &binding, false);
-        assert_eq!(first, [(0, (1024 - 511) * 32)]);
-        assert_eq!(state.tables(&list, &used, &binding, false), first);
-        // The fixed access consumed one slot; the indexed array still
-        // gets 512 consecutive slots after it and its original offsets.
+        // A table inside the host heap reads the title's slots there (its
+        // constant buffers as raw views): no fresh table, fixed slots or not.
+        assert_eq!(state.tables(&list, &used, &binding, false), []);
         binding[0].table_slots = None;
-        assert_eq!(state.tables(&list, &used, &binding, false), [(0, 1025 * 32)]);
+        assert_eq!(state.tables(&list, &used, &binding, false), []);
         state.set_table(false, 0, table + 32);
         binding[0].table_slots = Some((511, 511));
-        assert_eq!(state.tables(&list, &used, &binding, false), [(0, (1537 - 511) * 32)]);
+        assert_eq!(state.tables(&list, &used, &binding, false), []);
         drop(state);
         object::release_boxed::<Heap>(h);
     }

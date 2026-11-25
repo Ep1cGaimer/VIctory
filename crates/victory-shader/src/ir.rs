@@ -17,8 +17,6 @@
 //! program's VGPR count, or the largest M0 proven there ([`build_bounded`]),
 //! all read (and all written, for a destination).
 
-use std::collections::HashMap;
-
 use std::collections::{HashMap, HashSet};
 
 use crate::ShaderError;

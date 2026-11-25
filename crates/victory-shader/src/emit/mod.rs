@@ -178,9 +178,10 @@
 //!   console's in lanes (`[numthreads]` in the DXIL), the vertex and
 //!   primitive maxima its own, triangles only, no wave size required. The
 //!   console numbers groups in x only: the draw path passes the title's
-//!   count as `DispatchMesh(x, 1, 1)`. The host's `SV_CullPrimitive`
-//!   comes from the console's packed primitive export when it fits in the
-//!   output budget. Other shaders cull with degenerate triangles.
+//!   count as `DispatchMesh(x, 1, 1)`. Per-primitive outputs (`PSG1`) are
+//!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive`:
+//!   culled primitives are degenerate triangles (a host
+//!   `SV_CullPrimitive` drew nothing on the RTX 4060).
 
 mod bitcode;
 #[cfg(all(test, windows))]
@@ -485,7 +486,7 @@ pub fn emit_with(
     }
     // Per-primitive outputs are constant. The console's signature may
     // name a primitive ID or cull flag without allocating a parameter for
-    // it. The lowerer supplies the host cull flag from the primitive export.
+    // it; those rows are left out (culling is by the primitive export).
     let mut prims = sig(FourCC::PSG1)?;
     prims.retain(|e| !matches!(e.kind, 10 | 30));
     for e in &mut prims {
@@ -1008,10 +1009,11 @@ mod tests {
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
     }
 
-    /// A native cull declaration becomes the host's synthetic output,
-    /// including when the declared maxima exceed its emitting lanes.
+    /// A native cull declaration is left out of the host's signature (the
+    /// primitive export culls), also when the declared maxima exceed the
+    /// emitting lanes, and the module validates.
     #[test]
-    fn mesh_culling_uses_one_unallocated_primitive_output() {
+    fn a_native_cull_declaration_is_left_out() {
         let words = [
             0x7E10_0280u32, // v_mov_b32 v8, 0
             0x7E12_02FF,    // v_mov_b32 v9, 0x200400
@@ -1081,10 +1083,10 @@ mod tests {
             v.validate(&mut out.dxil.clone()).unwrap();
         }
         let out = Container::parse(&out.dxil).unwrap();
-        assert_eq!(out.part(FourCC::PSG1).unwrap().data, psg1);
+        assert_eq!(out.part(FourCC::PSG1).unwrap().data, container::signature(&[], false));
         let psv = out.part(FourCC::PSV0).unwrap().data;
-        assert_eq!(psv[4 + 26], 0, "cull flag must not allocate a row");
-        assert_eq!(psv[4 + 30], 1, "exactly one primitive output");
+        assert_eq!(psv[4 + 26], 0, "no primitive rows");
+        assert_eq!(psv[4 + 30], 0, "no primitive outputs");
     }
 
     /// Triangle (0, 1, 2), each corner's 9-bit index in its 10-bit field.

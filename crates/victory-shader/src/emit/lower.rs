@@ -571,28 +571,9 @@ impl<'a> Lower<'a> {
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
-            // A rowless cull value still adds one scalar per primitive to
-            // the validator's 32 KiB budget, counted at the declared maxima.
-            let scalars = |elements: &[SigElement]| -> u64 {
-                elements.iter().map(|e| u64::from(e.cols)).sum()
-            };
-            let vertices = u64::from(ms.max_vertices).next_multiple_of(32);
-            let primitives = u64::from(ms.max_primitives).next_multiple_of(32);
-            let bytes = 4 * (vertices * scalars(&s.outputs) + primitives * (scalars(&s.prims) + 1));
-            if bytes <= 32 * 1024 {
-                s.prims.push(SigElement {
-                    name: "SV_CullPrimitive".into(),
-                    index: 0,
-                    kind: 30,
-                    comp: 1,
-                    interp: 1,
-                    row: None,
-                    col: 0,
-                    cols: 1,
-                    usage: 1,
-                    half: false,
-                });
-            }
+            // No synthetic SV_CullPrimitive: a mesh program declaring one drew
+            // nothing on the RTX 4060 (`edge_flagged_triangles_draw_as_unflagged_ones`);
+            // culled primitives are degenerate triangles instead.
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
             s.mesh = Some(super::shader::Mesh {
@@ -2878,8 +2859,8 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh: declare the output counts and cull primitives until a lane
-    /// exports them. The console sends its counts from one lane, while
+    /// Mesh: declare the output counts and cull primitives (degenerate
+    /// triangles) until a lane exports them. The console sends its counts from one lane, while
     /// DXIL needs a single group-uniform call before any output stores.
     /// Use the maxima limited to the slots the host lanes can write.
     fn mesh_prologue(&mut self, mesh: super::shader::Mesh) -> Result<(), Why> {
@@ -2899,41 +2880,17 @@ impl<'a> Lower<'a> {
         let flat = self.mesh_thread();
         let guard = self.mesh_bound(true, None);
         let at = self.begin_guarded(guard);
-        if let Some(id) = self.mesh_cull_output_id() {
-            let culled = self.s.m.i32(1);
-            self.store_mesh_cull(id, flat, culled);
-        } else {
-            let zero = self.s.m.i32(0);
-            self.s.op(
-                self.cur,
-                "emitIndices",
-                Attr::NoUnwind,
-                void,
-                169,
-                &[flat, zero, zero, zero],
-            );
-        }
-        self.end_guarded(at, &[]);
-        Ok(())
-    }
-
-    fn mesh_cull_output_id(&self) -> Option<u32> {
-        let last = self.s.prims.last()?;
-        (last.kind == 30).then_some(self.s.prims.len() as u32 - 1)
-    }
-
-    fn store_mesh_cull(&mut self, id: u32, primitive: V, culled: V) {
-        let id = self.s.m.i32(id);
-        let row = self.s.m.i32(0);
-        let col = self.s.m.i8(0);
+        let zero = self.s.m.i32(0);
         self.s.op(
             self.cur,
-            "storePrimitiveOutput.i32",
+            "emitIndices",
             Attr::NoUnwind,
-            self.s.t.void,
-            172,
-            &[id, row, col, culled, primitive],
+            void,
+            169,
+            &[flat, zero, zero, zero],
         );
+        self.end_guarded(at, &[]);
+        Ok(())
     }
 
     /// Mesh: `guard` and the lane's vertex (with `per_primitive`, its
@@ -9495,8 +9452,7 @@ impl<'a> Lower<'a> {
     /// and 29), which only the console's edge-flag rasterisation reads and
     /// which is no part of the index. Bit 31 culls it, and so does an index
     /// past the declared vertex maximum, which the host leaves undefined (a
-    /// hang on some GPUs): through the synthetic cull output when there is
-    /// room for one, else as a degenerate triangle.
+    /// hang on some GPUs): as a degenerate triangle.
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
@@ -9512,34 +9468,24 @@ impl<'a> Lower<'a> {
         let limit = self.s.m.i32(max_vertices);
         let mask = self.s.m.i32(0x1FF);
         let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let primitive = self.mesh_thread();
-        let mut args = vec![primitive];
+        let mut indices = Vec::new();
         for k in 0..3 {
             let shift = self.s.m.i32(10 * k);
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             let past = self.s.m.cmp(c, pred::IUGE, i, limit);
             culled = self.s.m.bin(c, Bin::Or, culled, past);
-            args.push(i);
+            indices.push(i);
         }
-        let emit = if let Some(id) = self.mesh_cull_output_id() {
-            let one = self.s.m.i32(1);
-            let cull_value = self.s.m.select(c, culled, one, z);
-            self.store_mesh_cull(id, primitive, cull_value);
-            let live = self.s.m.cmp(c, pred::EQ, cull_value, z);
-            self.begin_guarded(Some(live))
-        } else {
-            // No room for a cull output. Use a degenerate triangle, as
-            // before, and never pass an out-of-range index to the host.
-            for i in &mut args[1..] {
-                *i = self.s.m.select(c, culled, z, *i);
-            }
-            None
-        };
+        // A culled primitive is a degenerate triangle: no out-of-range index
+        // reaches the host.
+        let mut args = vec![self.mesh_thread()];
+        for i in indices {
+            args.push(self.s.m.select(c, culled, z, i));
+        }
         let void = self.s.t.void;
         self.s
-            .op(self.cur, "emitIndices", Attr::NoUnwind, void, 169, &args);
-        self.end_guarded(emit, &[]);
+            .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
         self.end_guarded(at, &[]);
         Ok(())
     }

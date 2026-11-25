@@ -1338,7 +1338,7 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
-    let t = std::sync::Arc::new(make_texture(&d, state, clear)?);
+    let t = std::sync::Arc::new(make_texture(&d, desc.format, state, clear)?);
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1383,7 +1383,12 @@ fn current(this: This) -> bool {
 /// [`castable`]'s formats (colour textures, through the enhanced-barrier
 /// creation; it starts in the common state) where the host takes that.
 #[cfg(windows)]
-fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<HostTexture> {
+fn make_texture(
+    d: &ResourceDesc,
+    guest_format: u32,
+    state: u32,
+    clear: *const c_void,
+) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     use windows::core::Interface;
@@ -1393,7 +1398,8 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = if value[0] == desc.format && d.format == RGBA8_UNORM {
+        // A packed 16-bit target widened to RGBA8 clears in its own format.
+        value[0] = if value[0] == guest_format && d.format == RGBA8_UNORM {
             d.format
         } else {
             pc_format(value[0])
@@ -2842,7 +2848,9 @@ mod tests {
             let flags = if fmt == 86 { 5 } else { 1 };
             let desc = ResourceDesc { flags, ..texture(2560, 1440, fmt, 1) };
             let clear = [fmt, 0, 0, 0, 1f32.to_bits()];
-            let image = host_texture(&desc, 4, clear.as_ptr().cast()).expect("2560x1440 color target");
+            let image = make_texture(&host_desc(&desc).unwrap(), desc.format, 4, clear.as_ptr().cast())
+                .expect("2560x1440 color target");
+            let image = &image.texture;
             // SAFETY: query the target just created.
             let actual = unsafe { image.GetDesc() };
             assert_eq!(actual.Flags.0 as u32, flags);

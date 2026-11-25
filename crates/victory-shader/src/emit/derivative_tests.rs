@@ -11,8 +11,7 @@
 //! two threads along x), where 2x2 quads would choose level 2.
 
 use super::host::{Dispatch, Host, Root, View};
-use super::sampler::StaticSampler;
-use super::{HostShader, lower, validator};
+use super::{HostShader, validator};
 use crate::dxbc::{Container, FourCC};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -136,30 +135,10 @@ fn translate(native: &NativeProgram) -> Result<HostShader, crate::ShaderError> {
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })?;
-    Ok(HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        static_samplers: lowered
-            .samplers
-            .iter()
-            .map(|&w| StaticSampler::from_words(w))
-            .collect(),
-        samplers: lowered.samplers,
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-    })
+    // A compute program has no signatures: an empty container.
+    let bytes = crate::dxbc::build(&[]);
+    let c = Container::parse(&bytes)?;
+    super::emit(&c, native, &p, &st, &io, &res)
 }
 
 /// The `numthreads` in PSV0 (runtime info bytes 36-47) and the runtime
@@ -173,7 +152,9 @@ fn psv_threads(dxil: &[u8]) -> ([u32; 3], u32) {
 
 #[test]
 fn compute_derivatives_take_the_consoles_quads() {
-    let _one = super::host::gpu_test_lock();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for threads in [[8, 8, 1], [16, 4, 1], [32, 1, 1]] {
         let shader = translate(&program(threads)).expect("translate");
         // Declared flat (1D quads), with PSV0 runtime info version 3

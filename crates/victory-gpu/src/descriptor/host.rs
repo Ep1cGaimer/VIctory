@@ -1505,7 +1505,10 @@ mod tests {
         // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            // A host that caps its heaps below `HEAP_VIEWS` (NVIDIA) takes the
+            // smaller dynamic range instead (`HostHeap::new`).
+            let n = heap.heap.GetDesc().NumDescriptors;
+            assert!(n >= victory_shader::emit::HEAP_VIEWS || n == 4 + MIN_DYNAMIC, "{n} views");
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
