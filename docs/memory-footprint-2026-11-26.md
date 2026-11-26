@@ -242,6 +242,21 @@ Every run that reached about 6.5 minutes in the world died there, in one of two 
     | Stalled seconds | 17 | 11 |
 
     AJ reached frame 2,700 with no crash, and the pool peaked at 20,695.
+- **30 minutes in the world (run AL, HEAD a61e139, diagnostics build, `VICTORY_SHADER_LOOP_LIMIT=256`):** no crash and no device removal, through frame 3,600. The pool peaked at 19,582.
+
+  Commit levels off and does not climb:
+
+  | Minutes | Process commit | System commit (limit) | Lowest RAM available |
+  |---|---|---|---|
+  | 0–3 | 20.4 GB | 43.1 (43.8) GB | 135 MB |
+  | 9–12 | 22.6 GB | 45.3 (46.0) GB | 468 MB |
+  | 15–18 | 23.2 GB | 45.8 (47.0) GB | 627 MB |
+  | 27–30 | 22.8 GB | 45.7 (47.0) GB | 2,126 MB |
+
+  - The pagefile can still grow the limit to about 55.6 GB.
+  - Over the whole run, the median RAM available was 968 MB, and 11 seconds were stalled.
+- **The pipeline library's share:** it holds about 26,400 pipelines (1.18 GB, about 44 KB each). A run loads about 2,500 of them and starts about 2,700 early. Keeping only the used ones would cut about 1 GB of commit. But commit is not the limit now, and the blob's pages are paged out once loaded, so it would do little for RAM. It is not done.
+- **Release builds and the harness:** `VICTORY_KEYS`, the keys `run-probe.ps1` sends, works only in diagnostics builds (`gameinput.rs`). A scripted release run stays at the start screen (13 draws a frame, 30 fps) and never reaches the world. Runs 08651ef and a61e139 did this. Use the diagnostics build for scripted runs. Played by hand, release builds take real keys.
 - **The world, steady (AH):**
   - 1.3 fps, 785–798 ms a frame:
     - 336–350 ms preparing (copies 136–152 ms, 106–109 MB)

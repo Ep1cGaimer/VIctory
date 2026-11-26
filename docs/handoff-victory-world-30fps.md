@@ -55,6 +55,11 @@ Most of the gap between emitted and validated compute programs is compute shader
 
 ## Running the game
 
+**Known-good setup (2026-11-26, a61e139):**
+- Use the diagnostics build (`cargo build --profile diag -p victory --features diagnostics -j 4`) with `VICTORY_SHADER_LOOP_LIMIT=256`.
+- With these it ran 30 minutes in the world with no crash (run AL). The memory defaults since 6edc329 and the pool fix since 96e86dd need no switches.
+- Only diagnostics builds take the harness's scripted keys (`VICTORY_KEYS`). A scripted release run stays at the start screen.
+
 Use the harness in `tools/lab/`: `run-probe.ps1` is the launcher and `gpumem.ps1` is an optional GPU and commit memory monitor.
 
 - Copy `run-probe.ps1` into a lab folder; it was `%TEMP%\victory-30fps-lab`, with output under `output\<run>`. It sets these variables:
