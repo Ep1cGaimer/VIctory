@@ -73,6 +73,19 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    let pool_slots = std::env::var("VICTORY_TITLE_POOL_SLOTS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(victory_game::fixes::POOL_SLOTS);
+    for p in victory_game::fixes::patches(&hash, pool_slots) {
+        // SAFETY: just mapped; no title code has run.
+        let done = unsafe { image.patch_code(p.rva, p.expect, p.at, &p.write) }?;
+        if done {
+            println!("title fix      {} ({pool_slots})", p.name);
+        } else {
+            println!("title fix      {}: not where expected, left alone", p.name);
+        }
+    }
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(

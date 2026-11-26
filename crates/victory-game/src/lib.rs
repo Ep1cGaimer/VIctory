@@ -4,6 +4,7 @@
 //! is defined in docs/asset-policy.md.
 
 pub mod cityhash;
+pub mod fixes;
 pub mod pipelines;
 pub mod sgd5;
 pub mod shaderpack;

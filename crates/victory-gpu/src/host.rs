@@ -3795,7 +3795,8 @@ pub(crate) mod mem {
         let used = u32::from_le_bytes([head[0x10], head[0x11], head[0x12], head[0x13]]);
         let next = u64::from_le_bytes(head[0x20..0x28].try_into().unwrap_or_default());
         let stride = u32::from_le_bytes([head[8], head[9], head[10], head[11]]);
-        tracing::info!(used, stride, head = format_args!("{next:#x}"), empty = (next & 0x1ffff) == 0x1fffe, "title pool");
+        let slots = u32::from_le_bytes([head[12], head[13], head[14], head[15]]);
+        tracing::info!(used, slots, stride, head = format_args!("{next:#x}"), empty = (next & 0x1ffff) == 0x1fffe, "title pool");
     }
 
     /// The base of the title's image (the largest `victory-image-` module).
