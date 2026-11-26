@@ -3768,6 +3768,66 @@ pub(crate) mod mem {
     /// Once a second: while a submission runs past 3 s, or no frame was
     /// shown for 3 s, a line on what the GPU, memory and the system do (the
     /// fps line stops then, and a hung submission logs nothing until done).
+    /// A title pool's use (diagnostics, `VICTORY_PROBE_POOL`: the image
+    /// offset, in hex, of the pointer to it). Grand Theft Auto VI stops on
+    /// an `int3` when the lock-free pool its job threads take from at
+    /// `+0x5149a60` has no free slot (head index 0x1fffe); the pointer to
+    /// that one is at `a9ec938`. Logs the slots in use (dword 4) and the
+    /// head (qword 4).
+    fn title_pool() {
+        static AT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let Some(at) = *AT.get_or_init(|| {
+            let rva = usize::from_str_radix(std::env::var("VICTORY_PROBE_POOL").ok()?.trim_start_matches("0x"), 16).ok()?;
+            Some(image_base()? + rva)
+        }) else {
+            return;
+        };
+        let mut ptr = [0u8; 8];
+        if !super::read_into(at as *const u8, &mut ptr) {
+            return;
+        }
+        let pool = u64::from_le_bytes(ptr) as usize;
+        let mut head = [0u8; 0x28];
+        if pool == 0 || !super::read_into(pool as *const u8, &mut head) {
+            tracing::info!("title pool: not made yet");
+            return;
+        }
+        let used = u32::from_le_bytes([head[0x10], head[0x11], head[0x12], head[0x13]]);
+        let next = u64::from_le_bytes(head[0x20..0x28].try_into().unwrap_or_default());
+        let stride = u32::from_le_bytes([head[8], head[9], head[10], head[11]]);
+        tracing::info!(used, stride, head = format_args!("{next:#x}"), empty = (next & 0x1ffff) == 0x1fffe, "title pool");
+    }
+
+    /// The base of the title's image (the largest `victory-image-` module).
+    fn image_base() -> Option<usize> {
+        use windows_sys::Win32::Foundation::HMODULE;
+        use windows_sys::Win32::System::ProcessStatus::{K32EnumProcessModules, K32GetModuleBaseNameW, K32GetModuleInformation, MODULEINFO};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut modules = vec![std::ptr::null_mut(); 1024];
+        let mut needed = 0u32;
+        // SAFETY: our process and buffers of the sizes given.
+        unsafe {
+            let process = GetCurrentProcess();
+            if K32EnumProcessModules(process, modules.as_mut_ptr(), (modules.len() * size_of::<HMODULE>()) as u32, &mut needed) == 0 {
+                return None;
+            }
+            modules.truncate(needed as usize / size_of::<HMODULE>());
+            let mut best = None;
+            for m in modules {
+                let mut name = [0u16; 260];
+                let n = K32GetModuleBaseNameW(process, m, name.as_mut_ptr(), name.len() as u32) as usize;
+                let mut info = MODULEINFO { lpBaseOfDll: std::ptr::null_mut(), SizeOfImage: 0, EntryPoint: std::ptr::null_mut() };
+                if String::from_utf16_lossy(&name[..n]).starts_with("victory-image-")
+                    && K32GetModuleInformation(process, m, &mut info, size_of::<MODULEINFO>() as u32) != 0
+                    && best.is_none_or(|(_, size)| info.SizeOfImage > size)
+                {
+                    best = Some((info.lpBaseOfDll as usize, info.SizeOfImage));
+                }
+            }
+            best.map(|(base, _)| base)
+        }
+    }
+
     fn monitor() {
         let mb = |b: u64| b as f64 / 1048576.0;
         let mut faults = page_faults();
@@ -3800,6 +3860,9 @@ pub(crate) mod mem {
                 );
             }
             stalled = stall;
+            if second % 10 == 0 {
+                title_pool();
+            }
             if stall {
                 let (avail, total, commit, limit) = system_memory();
                 let (own_commit, working) = process_memory();
