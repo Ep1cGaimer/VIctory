@@ -225,6 +225,21 @@ Merge one branch at a time. After each merge, rerun the shader tests, clippy and
    - These are wave64 programs whose cross-lane code crosses 32-lane halves (`v_mbcnt`, `v_readlane`/`v_writelane`, `ds_(b)permute`, masks read as data). `lower.rs` ported only ztrx's first part.
    - ztrx main (`labRoot/ztrx-src`, `remotes/ztrx/main`, `emit/lower.rs` `exchange`, around lines 242–1515) has the second part: two host waves exchange through a pair of LDS dwords per console wave, with lane-uniform and own-bit analyses.
    - Porting it is the next step. It should restore the producers, end the runaway loops and the dropped indirect commands, and let the BVH builder run.
+   - **Check before porting (2026-11-26, from the earlier ztrx runs on this laptop, `labRoot/output/ztrx-*`).** ztrx refuses only 3–5 programs, and none of our top refused hashes appear in its drop lists. But its world frames are no faster on the GPU:
+
+     | Run | Frames past 500 draws | Median ms a frame | Preparing | GPU | Dropped |
+     |---|---|---|---|---|---|
+     | ztrx-run2 | 70 | 956 | 443 | 221 | 1,052 |
+     | ztrx-cardsoff | 54 | 1,389 | 705 | 389 | 561 |
+     | ours, AL | (30 min) | about 700 | 361 | 245 | about 6,200 |
+
+     So the exchange would mostly cure dropped draws (a rendering fix). It is worth tens of milliseconds of GPU time, not hundreds. Its risk to reliability (ztrx's `e9765a7` fixed a device loss it caused) argues for an offline-first port behind an off-by-default switch, gated by a 30-minute run.
+   - **Preparing and the GPU run one after the other.** `host.rs` around line 1311: every submission is `ExecuteCommandLists`, `Signal` and `WaitForSingleObject(INFINITE)`, before the copy back. At about 700 ms a frame:
+     - with no GPU time at all, about 2.2 fps;
+     - with no preparing at all, about 3 fps;
+     - overlapping the two, at most about 1.7–2 fps.
+
+     30 fps (33 ms) needs both cut by more than 10x. No fork tried on this laptop has passed about 2 fps in the world. fxceless reports 7–12 fps on an RTX 4070 with 32 GB of RAM.
 
 1. **Correct and isolate the shadow-trace binding.** Size `t1,space2` for every physical slot the shader may read. On this heap the extra storage is 2 MiB. Populate dynamic entries even if they predate the lazy creation of the address buffer. For dimension 11, publish the descriptor's 64-bit guest location. Clear stale entries on reuse and bounds-check the index against the metadata allocation before issuing a root load. Capture the actual rebased table, both resulting VAs and the post-clamp argument record immediately before the enabled dispatch.
 
