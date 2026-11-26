@@ -900,7 +900,26 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // The default adapter is DXGI's first, which on hybrid laptops is
+            // the integrated GPU: its few hundred MB of local memory spill the
+            // world's textures into shared memory until creation fails.
+            let filter = std::env::var("VICTORY_ADAPTER").ok().filter(|s| !s.trim().is_empty());
+            match hardware_adapter(filter.as_deref()) {
+                Ok((adapter, desc)) => {
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                    tracing::info!(
+                        adapter = %adapter_name(&desc.Description),
+                        vendor = format_args!("{:#06x}", desc.VendorId),
+                        local_mb = desc.DedicatedVideoMemory >> 20,
+                        "host adapter"
+                    );
+                }
+                Err(e) if filter.is_some() => {
+                    tracing::error!(filter = filter.as_deref(), "no D3D12 adapter matches VICTORY_ADAPTER");
+                    return Err(e);
+                }
+                Err(_) => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -994,6 +1013,51 @@ impl Host {
         let adapter = self.adapter.as_ref();
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
+    }
+}
+
+fn adapter_name(raw: &[u16]) -> String {
+    let len = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+    String::from_utf16_lossy(&raw[..len])
+}
+
+/// The first hardware adapter that makes a D3D12 device, high-performance
+/// GPUs first; with `filter` (`VICTORY_ADAPTER`), the first whose name
+/// contains it, ignoring case.
+fn hardware_adapter(filter: Option<&str>) -> windows::core::Result<(IDXGIAdapter1, DXGI_ADAPTER_DESC1)> {
+    let want = filter.map(|f| f.trim().to_lowercase());
+    // SAFETY: plain DXGI enumeration and a D3D12 support probe.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let by_preference = factory.cast::<IDXGIFactory6>().ok();
+        for i in 0.. {
+            let adapter: windows::core::Result<IDXGIAdapter1> = match &by_preference {
+                Some(f) => f.EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE),
+                None => factory.EnumAdapters1(i),
+            };
+            let adapter = match adapter {
+                Ok(a) => a,
+                Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(e) => return Err(e),
+            };
+            let desc = adapter.GetDesc1()?;
+            let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            let fits = match &want {
+                Some(w) => adapter_name(&desc.Description).to_lowercase().contains(w.as_str()),
+                None => !software,
+            };
+            if fits
+                && D3D12CreateDevice(
+                    &adapter,
+                    D3D_FEATURE_LEVEL_12_0,
+                    std::ptr::null_mut::<Option<ID3D12Device>>(),
+                )
+                .is_ok()
+            {
+                return Ok((adapter, desc));
+            }
+        }
+        Err(windows::core::Error::from_hresult(DXGI_ERROR_NOT_FOUND))
     }
 }
 

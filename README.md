@@ -1,3 +1,31 @@
+# VIctory on NVIDIA (RTX 4060 Laptop, 8 GB)
+
+This branch (`victory-cgbj-nvidia`) is the CGBJ build (codec_d's
+pareto-residency fork of VIctory-7900XTX, GPL-3.0) brought to an NVIDIA laptop:
+
+- **Job-slot pool fix:** the title's 224-byte job-slot pool is sized to
+  131,069 slots in memory at load (`VICTORY_TITLE_POOL_SLOTS`; 0 keeps the
+  title's own). Without it the title stops on an `int3` about 7 minutes into
+  the world.
+- **The high-performance GPU:** the host device is made on the
+  high-performance adapter, not DXGI's first (the integrated GPU on hybrid
+  laptops). `VICTORY_ADAPTER=<part of the name>` picks one.
+
+Measured on an RTX 4060 Laptop (8 GB), Ryzen 7 7840HS and 15.3 GB of RAM,
+`--console series-s`, the launcher's settings (2026-11-26):
+
+| | |
+|---|---|
+| Menus, videos, loading screens | 30 fps |
+| In the world, 15 minutes | 2.0 fps median (2.9 at best), no crash |
+| Frame in the world | about 470 ms: 350 on the GPU, 100 preparing |
+| Memory | 20.7 GB private, about 3 GB resident; 41.6 of 45 GB committed |
+
+This laptop runs out of RAM: it pages for the whole run. 32 GB of RAM or more is
+what this build needs.
+
+---
+
 # VIctory on an RX 7900 XTX
 
 ## Run the codec_d Windows build
