@@ -82,6 +82,14 @@ Use the harness in `tools/lab/`: `run-probe.ps1` is the launcher and `gpumem.ps1
 
 ## What this branch did (newest first)
 
+- **171de15 / 96e86dd / 0c590d3 (reliable past 6.5 minutes)**
+  - Every run that reached about 6.5 minutes in the world used to die there.
+  - **The title's job slot pool ran dry** (an `int3` at `+0x5149aec`). Its slots in use climb from about 8,500 to 20,000–24,000, then fall back.
+    - 96e86dd gives the pool 65,536 slots at load, in memory only. `VICTORY_TITLE_POOL_SLOTS` sets the count; 0 keeps the title's own size.
+    - The diagnostics probe `VICTORY_PROBE_POOL=a9ec938` logs the pool every 10 s.
+  - **The driver's internal error removed the device** (`0x887A0020`). It happened only with the pipeline library mapped from its file (b6fd495), in 4 of 5 runs. 171de15 reverts that.
+  - With both fixes, a 13-minute run reached frame 3,000 with no crash.
+  - See `docs/memory-footprint-2026-11-26.md`, step 4.
 - **6edc329** The memory settings are now the defaults: 64 KiB loose windows given up after 20 s idle, read-only copies in video memory, and a 512 MiB snapshot pool. A 12-minute run and a 10-minute run with them reached the world without a crash. The world runs at 600–700 ms a frame, about 270–370 ms preparing and about 275 ms on the GPU. The stalls are paging episodes.
 - **3be1ffe / bab0189 (host copies of title memory)** Loose windows are 64 KiB, given up when idle, and let go when a larger window covers them. Buffer lookups are bounded to their range. With `VICTORY_COPIES_IN_VIDEO=1` (opt-in), read-only copies go in the GPU upload heap. A copy that shaders write is made again in system memory, and stale title slots are made again. Card system memory is down from 3.3–4.7 GB to 2.1–2.7 GB, and copying back is about 20 ms a frame. RAM still runs out at the peak of the load. See `docs/memory-footprint-2026-11-26.md`, step 3. These are the defaults since 6edc329. Runs here use `VICTORY_SHADER_LOOP_LIMIT=256`.
 - **a14fee5 + census** Host textures can be let go when idle (`VICTORY_TEXTURE_IDLE_S`, opt-in). A census by holder and the card's memory budget are logged once a second. Result: 4.2 of 4.9 GB are targets with distinct title memory, so there is nothing to let go while loading. The watchdog crash after the first 2.7 s submission is the blocker before the world. See `docs/memory-footprint-2026-11-26.md`, step 2.

@@ -172,6 +172,65 @@ The old `host::mem` counters were cumulative ("made"). The new "host memory live
   - View copies.
   - Use tracking from the GPU side, so that windows that are idle but still held by a page table can be let go.
 
+## Step 4: past the 6.5-minute mark (2026-11-26, runs `mem-AA` to `mem-AI`)
+
+Every run that reached about 6.5 minutes in the world died there, in one of two ways. Both are dealt with now.
+
+- **The title's job slot pool runs dry.**
+  - The title stops on an `int3` at `victory-image…dll+0x5149aec` (0x80000003, on three job threads at once). Other forks' runs show the same crash.
+  - The code at `+0x5149a60` takes a 224-byte slot from a lock-free pool and breaks when the free list is empty. The pool's pointer is at image offset `a9ec938`. Its header holds:
+    - `+0x0`: the slots
+    - `+0x8`: the stride
+    - `+0xc`: the slot count
+    - `+0x10`: slots in use
+    - `+0x20`: the head (17-bit index; `0x1fffe` is empty, with a 10-bit generation above it)
+    - `+0x28`: the next-index array
+  - The function at `+0x5ad8e40` sizes the pool from the title's pool-size table, entry `0x5411e15c` (default 1).
+  - The probe (`VICTORY_PROBE_POOL=a9ec938`, diagnostics) logs the slots in use every 10 s:
+    - about 8,500 in steady play;
+    - 20,000–24,000 a few minutes later;
+    - back to 6,600–9,600 after the spike.
+  - The title's own size is a little over 21,416 (the most seen before a crash).
+  - **Fix (96e86dd):** at load, the size lookup's call becomes `mov eax, 65536`. It is checked against a signature and written in memory only. `VICTORY_TITLE_POOL_SLOTS` sets the count; 0 keeps the title's own size. It costs 15 MB.
+- **The driver's internal error removes the device (`0x887A0020`).**
+  - It came only with the pipeline library mapped from its file (b6fd495).
+  - DRED shows no page fault and no breadcrumbs.
+  - The command in flight differed every time: a texture upload, an indexed draw, a mesh draw, a 1×1×1 dispatch.
+  - There was no stall just before it: RAM available was 660–900 MB, and video memory was 6.7 of 7.2 GB.
+  - The cause is not known. A guess: the driver reads the library from file pages that the system had trimmed.
+  - **Fix (171de15):** b6fd495 is reverted.
+  - What b6fd495 had saved:
+
+    | Commit | With the library read in | With it mapped |
+    |---|---|---|
+    | Process, at boot | 11.5 GB | 9.2–10.6 GB |
+    | Process, in the world | about 20 GB | 18.2–18.6 GB |
+    | System, at the peak | 45–49 GB | 41.7–42.2 GB |
+
+| Run | Library | Pool fix | Length | End |
+|---|---|---|---|---|
+| AA | mapped | no | 6 min (planned) | none |
+| AB | mapped | no | 6.5 min | pool `int3` |
+| AC | mapped | no | 6.7 min | device removed, `0x887A0020` |
+| AD | mapped | no | 8.1 min | device removed after the pool peaked at 20,927 and fell back to 8,077 |
+| AE | mapped, DRED | no | 6.7 min | device removed; no page fault, no breadcrumbs |
+| AF | read in | no | 7.4 min | pool `int3` after 21,416 in use |
+| AG | mapped | yes | 11 min (planned) | none; pool at most 20,187 (samples every 30 s) |
+| AH | mapped | yes | 10.7 of 15 min | device removed, `0x887A0020`; pool at most 19,795 |
+| AI | read in | yes | 13 min (planned) | none; frame 3,000, pool at most 23,989 |
+
+- In AI:
+  - RAM available fell to 1 MB at the lowest.
+  - System commit peaked at 45.7 GB.
+  - 17 seconds were stalled.
+  - So RAM is still the next limit for long runs.
+- **The world, steady (AH):**
+  - 1.3 fps, 785–798 ms a frame:
+    - 336–350 ms preparing (copies 136–152 ms, 106–109 MB)
+    - 359–372 ms on the GPU
+    - 34–39 ms copying back
+  - 2,650 draws a frame, 763–783 of them dropped without a host pipeline.
+
 ## More references (from the user's research agents, 2026-11-26; checked only where noted)
 - **fxceless's fork (its pushed main, GPL-3.0; reviewed in part):** `resource.rs` `room()` and `let_go_idle()`, a texture budget from `QueryVideoMemoryInfo` with a 2 GiB floor, at 90 % of budget. It sweeps idle textures the title fills and the host never wrote, if no list or slot holds them. Also `texture.rs` `let_go_idle` for staging, `HostHeap::texture_slot_gone`, a snapshot pool capped at 512 MiB, `VICTORY_WINDOW_KB`/`VICTORY_WINDOW_TAILS`, and card buffers. Reported to carry an RTX 3050 8 GB for 90 minutes at 1–3 fps with a large pagefile.
 - **XCL (GPL-2.0-only; ideas only, see below):** a self-sizing coherent heap with its size remembered between runs (`cache/uma_coherent.txt`), sparse VRAM windows through `UpdateTileMappings`, and batched write-watch.
