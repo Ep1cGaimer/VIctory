@@ -224,6 +224,24 @@ Every run that reached about 6.5 minutes in the world died there, in one of two 
   - System commit peaked at 45.7 GB.
   - 17 seconds were stalled.
   - So RAM is still the next limit for long runs.
+- **Pipeline library saves (caefb47):**
+  - Before, every early-list change made the whole library (1.18 GB) be serialised and written again, every 20–30 s.
+  - Now the early list is written alone. The library is serialised only when pipelines were added and one of these holds:
+    - 64 of them are waiting;
+    - 5 minutes have passed;
+    - the run ends;
+    - the prebuilt list changed.
+  - Run AJ (13 minutes, against AI):
+
+    | | AI | AJ |
+    |---|---|---|
+    | Library writes | every 20–30 s | 1 |
+    | Early-list writes | | 31 |
+    | Lowest RAM available | 1 MB | 114 MB (median 584 MB) |
+    | Peak system commit | 45.7 GB | 44.7 GB |
+    | Stalled seconds | 17 | 11 |
+
+    AJ reached frame 2,700 with no crash, and the pool peaked at 20,695.
 - **The world, steady (AH):**
   - 1.3 fps, 785–798 ms a frame:
     - 336–350 ms preparing (copies 136–152 ms, 106–109 MB)

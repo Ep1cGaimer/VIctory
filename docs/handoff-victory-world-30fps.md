@@ -82,6 +82,8 @@ Use the harness in `tools/lab/`: `run-probe.ps1` is the launcher and `gpumem.ps1
 
 ## What this branch did (newest first)
 
+- **caefb47** The pipeline library (1.18 GB) is serialised only when pipelines were added: once 64 are waiting, after 5 minutes, at exit, or when the prebuilt list changed. Before, it was written again every 20–30 s. The early list is written by itself.
+  - In a 13-minute run, the library was written once, the lowest RAM available was 114 MB instead of 1 MB, and there was no crash.
 - **171de15 / 96e86dd / 0c590d3 (reliable past 6.5 minutes)**
   - Every run that reached about 6.5 minutes in the world used to die there.
   - **The title's job slot pool ran dry** (an `int3` at `+0x5149aec`). Its slots in use climb from about 8,500 to 20,000–24,000, then fall back.
