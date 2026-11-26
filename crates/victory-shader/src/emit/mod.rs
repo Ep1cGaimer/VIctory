@@ -196,7 +196,7 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
-pub use lower::{host_max_wave, set_host_max_wave};
+pub use lower::{host_max_wave, set_host_max_wave, set_why_label, wave_exchange, wave_key};
 mod rect;
 pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]
@@ -216,6 +216,8 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
+#[cfg(all(test, windows))]
+mod wave_exchange_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};

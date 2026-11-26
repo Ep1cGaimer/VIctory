@@ -607,6 +607,11 @@ fn translate(
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
                     let marks = emit::Options { view_marks: true };
+                    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                        // the title's name for the container: its BLAKE3's first 8 bytes
+                        let h = blake3::hash(&bytes).to_hex();
+                        emit::set_why_label(format!("{} {}", &h[..16], label()));
+                    }
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;

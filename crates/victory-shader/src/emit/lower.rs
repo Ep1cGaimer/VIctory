@@ -86,6 +86,29 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    EXCHANGED.set(false);
+    let r = lower_once(parts);
+    // A program the exchange cannot lower (a lane read where not every lane
+    // runs, a wave reduction across the halves...) is lowered as before.
+    if let Err(e) = &r
+        && EXCHANGED.get()
+    {
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            eprintln!("wave64 exchange refused: {e} [{}]", why_label());
+        }
+        NO_EXCHANGE.set(true);
+        let again = lower_once(parts);
+        NO_EXCHANGE.set(false);
+        EXCHANGED.set(false);
+        return again;
+    }
+    if r.is_ok() && EXCHANGED.get() && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        eprintln!("wave64 exchange: lowered in waves of 32 [{}]", why_label());
+    }
+    r
+}
+
+fn lower_once(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad).run() {
@@ -240,6 +263,17 @@ struct Lower<'a> {
     /// the console threads handed to host waves ([`Lower::wave_base`]).
     halves: Option<u32>,
     wave_base: Option<V>,
+    /// [`wave_exchange`]: the first exchange dword, whether the group is
+    /// one host wave (32 threads or fewer: nothing to exchange), and per IR
+    /// block whether every lane runs it ([`all_lane_blocks`]).
+    exchange: Option<(u32, bool, Vec<bool>)>,
+    /// This thread's console lane and exchange pair ([`Lower::console_lane`],
+    /// [`Lower::exchange_pair`]), made in the entry block.
+    clane: Option<V>,
+    pair: Option<V>,
+    /// With `exchange`: VGPR values every lane holds alike ([`lane_uniform`]),
+    /// whose first lane is any lane's.
+    uniform: HashSet<Value>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -505,7 +539,67 @@ pub fn set_host_max_wave(lanes: u32) {
 
 /// See [`set_host_max_wave`].
 pub fn host_max_wave() -> u32 {
+    #[cfg(test)]
+    if let Some((lanes, _)) = TEST_WAVE.get() {
+        return lanes;
+    }
     HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `VICTORY_WAVE_EXCHANGE=1`: on a 32-lane host, a console wave64 program
+/// whose code crosses its 32-lane halves (lane reads and writes, `v_mbcnt`,
+/// masks read as numbers), in a group of at most one console wave, runs as
+/// two host waves of 32 that exchange what crosses through two LDS dwords
+/// at group barriers (from ztrx main's `exchange`). Only where every lane
+/// of the group runs (no lane branch around it); one console wave per group,
+/// so both host waves take the same scalar branches and loop trips and meet
+/// at every barrier. Off by default; in the shader cache key ([`wave_key`]).
+pub fn wave_exchange() -> bool {
+    #[cfg(test)]
+    if let Some((_, on)) = TEST_WAVE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_EXCHANGE").is_some_and(|v| v == "1"))
+}
+
+/// The wave lowering as the shader cache keys it: the host's widest wave,
+/// and the exchange in bit 16 (off keys as before).
+pub fn wave_key() -> u32 {
+    host_max_wave() | u32::from(wave_exchange()) << 16
+}
+
+thread_local! {
+    /// `VICTORY_WAVE_WHY`: what the reason lines name the program by.
+    static WHY_LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Names the programs lowered next on this thread in `VICTORY_WAVE_WHY` lines.
+pub fn set_why_label(label: String) {
+    WHY_LABEL.set(label);
+}
+
+fn why_label() -> String {
+    WHY_LABEL.with_borrow(|s| s.clone())
+}
+
+thread_local! {
+    /// The program being lowered was given the exchange.
+    static EXCHANGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Its lowering with the exchange failed: lower it as before.
+    static NO_EXCHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the host's widest wave and the exchange, for this thread.
+    pub(super) static TEST_WAVE: std::cell::Cell<Option<(u32, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: whether the last program lowered on this thread kept the exchange.
+#[cfg(test)]
+pub(super) fn exchanged() -> bool {
+    EXCHANGED.get()
 }
 
 /// Masks held as numbers or constant lane sets in guards or lane branches:
@@ -524,6 +618,61 @@ fn lane_constant_masks(st: &Structured) -> bool {
             .iter()
             .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
     })
+}
+
+/// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
+/// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
+/// constants and such values; or loaded from an address made of them. The compiler keeps
+/// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
+/// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
+/// run (no lane branch can have split the arriving lanes); loop-carried values never do.
+fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let mut same: HashSet<Value> = HashSet::new();
+    for b in crate::ir::reverse_postorder(&p.blocks) {
+        let block = &p.blocks[b];
+        let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
+        for phi in &block.phis {
+            if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
+                same.insert(phi.value);
+            }
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            let name = inst.name();
+            let ops: Vec<Operand> = match &inst.fields {
+                Fields::Valu(v)
+                    if v.dpp.is_none()
+                        && v.sdwa.is_none()
+                        && !name.starts_with("v_mbcnt")
+                        && !name.starts_with("v_cmpx")
+                        && !name.contains("lane") =>
+                {
+                    v.src.clone()
+                }
+                _ => continue,
+            };
+            if st.guards[b][i].is_some() {
+                continue; // lanes outside EXEC keep another value
+            }
+            let alike = ops.iter().all(|op| match *op {
+                Operand::Vector { reg, .. } => {
+                    // every dword of the operand the instruction reads from that register on
+                    let read: Vec<Value> =
+                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+                    !read.is_empty() && read.iter().all(|x| same.contains(x))
+                }
+                // a scalar is one value; a lane mask is not, unless a compare of such values made it
+                Operand::Scalar { code, .. } if code != NULL => {
+                    inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
+                }
+                _ => true,
+            });
+            if alike {
+                same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+            }
+        }
+    }
+    same
 }
 
 /// Per IR block: every lane of the wave that started the program runs it –
@@ -720,6 +869,7 @@ impl<'a> Lower<'a> {
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
         let (mut split_lds, mut lds_meet, mut halves) = (false, None, None);
+        let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -774,21 +924,62 @@ impl<'a> Lower<'a> {
                 let group: u32 = cs.threads.iter().product();
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
                     wave = 32;
-                } else if !crosses && let Some(all) = all_lane_blocks(x.st) {
+                } else if (!crosses || wave_exchange() && !NO_EXCHANGE.get() && group <= 64)
+                    && let Some(all) = all_lane_blocks(x.st)
+                {
                     let lds = |i: &Inst| {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
+                    let shared = s.lds_dwords > 0 && group > 32;
                     let every = p.blocks.iter().enumerate().all(|(b, blk)| {
                         blk.insts.iter().all(|i| !lds(i) || all.get(b).copied().unwrap_or(false))
                     });
-                    if every {
+                    if !shared || every {
                         wave = 32;
                     } else if let Some(meet) = lds_meetings(p, x.st, &all) {
-                        lds_meet = Some((all, meet));
+                        lds_meet = Some((all.clone(), meet));
                         wave = 32;
                     }
-                    split_lds = wave == 32;
+                    split_lds = wave == 32 && shared;
+                    if wave == 32 && crosses {
+                        // lanes 32..63 are the other host wave: what crosses
+                        // goes through two dwords past the program's LDS
+                        exchange = Some((s.lds_dwords, group <= 32, all));
+                        s.lds_dwords += 2 * group.div_ceil(64);
+                        EXCHANGED.set(true);
+                    }
+                }
+                // `VICTORY_WAVE_WHY=1`: why a program keeps 64-lane waves on a
+                // 32-lane host (one line, the reasons; from ztrx main).
+                if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                    let mut why: Vec<&str> = Vec::new();
+                    for i in insts() {
+                        let n = i.name();
+                        let r = if n.starts_with("v_mbcnt") {
+                            "v_mbcnt"
+                        } else if n == "v_readlane_b32" {
+                            "v_readlane"
+                        } else if n == "v_writelane_b32" {
+                            "v_writelane"
+                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
+                            "ds_(b)permute"
+                        } else if reads_mask_as_data(x.st, i) {
+                            "mask as data"
+                        } else {
+                            continue;
+                        };
+                        if !why.contains(&r) {
+                            why.push(r);
+                        }
+                    }
+                    if lane_constant_masks(x.st) {
+                        why.push("lane-constant masks");
+                    }
+                    if !crosses && s.lds_dwords > 0 && group > 32 {
+                        why.push("LDS in lane branches");
+                    }
+                    eprintln!("wave64 kept: group {group}, lds {} dwords: {} [{}]", s.lds_dwords, why.join(", "), why_label());
                 }
             }
             if wave == 32 && x.native.wave64 {
@@ -893,6 +1084,13 @@ impl<'a> Lower<'a> {
             lds_meet,
             halves,
             wave_base: None,
+            uniform: match &exchange {
+                Some((_, false, all)) => lane_uniform(p, x.st, all),
+                _ => HashSet::new(),
+            },
+            exchange,
+            clane: None,
+            pair: None,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -1339,6 +1537,11 @@ impl<'a> Lower<'a> {
     /// expanded gives on that wave.
     fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
         use super::wave::{Op, Shape};
+        if self.exchanging() && !matches!(shape, Shape::K(_) | Shape::Value(_) | Shape::Masked(..)) {
+            // shortcut: no reduction across the two host waves yet (ztrx
+            // main adds the halves' results through the exchange)
+            return Err("a wave reduction across two host waves");
+        }
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
@@ -2049,7 +2252,16 @@ impl<'a> Lower<'a> {
                     .s
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let mut xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                if self.exchanging() {
+                    // a host wave's ballot is its half's 32 bits: the halves
+                    // exchange them, where every lane runs the block
+                    let b = self.def_block.get(&lo).copied();
+                    if !b.is_none_or(|b| self.all_lanes(b)) {
+                        return Err("a lane mask exchanged where not every lane runs");
+                    }
+                    xy = self.exchange_halves(at, xy.0);
+                }
                 self.ballots.insert(lo, xy);
                 xy
             }
@@ -2763,14 +2975,11 @@ impl<'a> Lower<'a> {
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         self.s.flags |= flags::WAVE_OPS;
-        let lane = self.s.op(
-            at,
-            "waveGetLaneIndex",
-            Attr::ReadOnly,
-            self.s.t.i32,
-            111,
-            &[],
-        );
+        let lane = if self.exchange.is_some() {
+            self.console_lane()
+        } else {
+            self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
+        };
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
@@ -3229,6 +3438,98 @@ impl<'a> Lower<'a> {
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
+    /// The console thread index of this thread in the group: `wave_base` plus
+    /// the host lane. (From ztrx main.)
+    fn console_thread(&mut self) -> V {
+        let (e, i32t) = (self.s.entry, self.s.t.i32);
+        let base = self.wave_base().expect("an exchange runs in halves");
+        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        self.s.m.bin(e, Bin::Add, base, lane)
+    }
+
+    /// This thread's console lane (0..63): host waves hold 32-aligned runs of
+    /// console threads. Without `exchange`: the host lane. (From ztrx main.)
+    fn console_lane(&mut self) -> V {
+        if self.exchange.is_none() {
+            return self.lane_index();
+        }
+        if let Some(v) = self.clane {
+            return v;
+        }
+        let e = self.s.entry;
+        let f = self.console_thread();
+        let k63 = self.s.m.i32(63);
+        let cl = self.s.m.bin(e, Bin::And, f, k63);
+        self.s.flags |= flags::WAVE_OPS;
+        self.clane = Some(cl);
+        cl
+    }
+
+    /// Whether every lane runs IR block `b` (always without `exchange`).
+    fn all_lanes(&self, b: usize) -> bool {
+        self.exchange.as_ref().is_none_or(|(_, _, all)| all.get(b).copied().unwrap_or(false))
+    }
+
+    /// Whether the two host waves of the console wave exchange (a group over
+    /// 32 threads with `exchange`).
+    fn exchanging(&self) -> bool {
+        self.exchange.as_ref().is_some_and(|e| !e.1)
+    }
+
+    /// `exchange`: each host wave gives `mine` (alike in all its lanes) for
+    /// its half, at block `at`; both get (lower half's, upper half's).
+    /// Two group barriers. A group of one host wave gets 0 for the upper.
+    /// (From ztrx main.)
+    fn exchange_halves(&mut self, at: usize, mine: V) -> (V, V) {
+        let Some(slot) = self.exchange.as_ref().filter(|e| !e.1).map(|e| e.0) else {
+            let z = self.s.m.i32(0);
+            return (mine, z);
+        };
+        let pair = self.exchange_pair(slot);
+        let cl = self.console_lane();
+        let five = self.s.m.i32(5);
+        let half = self.s.m.bin(at, Bin::LShr, cl, five);
+        let index = self.s.m.bin(at, Bin::Add, pair, half);
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(at, lds, index);
+        self.s.m.store(at, ptr, mine);
+        self.group_sync(at);
+        let one = self.s.m.i32(1);
+        let k1 = self.s.m.bin(at, Bin::Add, pair, one);
+        let p0 = self.s.m.element(at, lds, pair);
+        let p1 = self.s.m.element(at, lds, k1);
+        let lo = self.s.m.load(at, p0);
+        let hi = self.s.m.load(at, p1);
+        // the dwords are written again only after every thread read them
+        self.group_sync(at);
+        (lo, hi)
+    }
+
+    /// The first of the two exchange dwords of this thread's console wave
+    /// (in the entry block). (From ztrx main.)
+    fn exchange_pair(&mut self, slot: u32) -> V {
+        if let Some(v) = self.pair {
+            return v;
+        }
+        let e = self.s.entry;
+        let thread = self.console_thread();
+        let six = self.s.m.i32(6);
+        let wave = self.s.m.bin(e, Bin::LShr, thread, six);
+        let one = self.s.m.i32(1);
+        let twice = self.s.m.bin(e, Bin::Shl, wave, one);
+        let base = self.s.m.i32(slot);
+        let v = self.s.m.bin(e, Bin::Add, base, twice);
+        self.pair = Some(v);
+        v
+    }
+
+    /// A group barrier with an LDS fence in DXIL block `block`.
+    fn group_sync(&mut self, block: usize) {
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
@@ -3405,6 +3706,10 @@ impl<'a> Lower<'a> {
             // Each lane reads `data` of the lane its address plus the offset
             // names in dwords (modulo the wave); 0 from a lane EXEC leaves out.
             self.cross_lane(false)?;
+            if self.exchanging() {
+                // the lane named may be in the other host wave
+                return Err("a lane permute across two host waves");
+            }
             let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -6475,6 +6780,30 @@ impl<'a> Lower<'a> {
                 } else {
                     self.cross_lane(false)?;
                 }
+                if let Some(slot) = self.exchange.as_ref().filter(|e| !e.1).map(|e| e.0) {
+                    // the lane holding it may be in the other host wave: it
+                    // gives it through LDS, where every lane runs (from ztrx main)
+                    if !self.all_lanes(self.cur_ir) {
+                        return Err("a lane read where not every lane runs");
+                    }
+                    let cl = self.console_lane();
+                    // (the console takes the lane number modulo 64)
+                    let k63 = self.s.m.i32(63);
+                    let lane = self.s.m.bin(self.cur, Bin::And, lane, k63);
+                    let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
+                    let k = self.exchange_pair(slot);
+                    let at = self.begin_guarded(Some(is));
+                    let lds = self.s.lds();
+                    let ptr = self.s.m.element(self.cur, lds, k);
+                    self.s.m.store(self.cur, ptr, a);
+                    self.end_guarded(at, &[]);
+                    let c2 = self.cur;
+                    self.group_sync(c2);
+                    let ptr = self.s.m.element(c2, lds, k);
+                    let r = self.s.m.load(c2, ptr);
+                    self.group_sync(c2);
+                    return int(self, r);
+                }
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
@@ -6489,7 +6818,7 @@ impl<'a> Lower<'a> {
                     None => self.s.m.i32(0),
                 };
                 self.cross_lane(false)?;
-                let me = self.lane_index();
+                let me = self.console_lane();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -6516,6 +6845,27 @@ impl<'a> Lower<'a> {
                     &[a],
                 );
                 let r = self.helper_reads_own(a, r);
+                let alike = match v.src.first() {
+                    Some(&Operand::Vector { reg, .. }) => {
+                        inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.contains(&x))
+                    }
+                    _ => true,
+                };
+                let r = if self.exchanging() && !alike {
+                    // the console's first lane may be in the other host wave.
+                    // Unguarded where every lane runs: it is lane 0, which the
+                    // lower half has (from ztrx main).
+                    if guard.is_some() {
+                        return Err("a guarded first-lane read across two host waves");
+                    }
+                    if !self.all_lanes(self.cur_ir) {
+                        return Err("a first-lane read where not every lane runs");
+                    }
+                    let c = self.cur;
+                    self.exchange_halves(c, r).0
+                } else {
+                    r
+                };
                 int(self, r)
             }
             _ => {
@@ -7592,7 +7942,7 @@ impl<'a> Lower<'a> {
                 } else if self.s.mesh.is_none() {
                     self.cross_lane(false)?;
                 }
-                let lane = self.lane_index();
+                let lane = self.console_lane();
                 let below = if name == "v_mbcnt_lo_u32_b32" {
                     lane
                 } else {

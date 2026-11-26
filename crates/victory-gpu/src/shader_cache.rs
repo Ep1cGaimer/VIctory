@@ -73,7 +73,7 @@ fn build() -> &'static [u8; 32] {
             ENCODING,
             limit,
             victory_shader::emit::heap_views(),
-            victory_shader::emit::host_max_wave(),
+            victory_shader::emit::wave_key(),
         )
     })
 }
@@ -481,7 +481,7 @@ mod tests {
                 ENCODING,
                 victory_shader::emit::loop_limit(),
                 victory_shader::emit::heap_views(),
-                victory_shader::emit::host_max_wave()
+                victory_shader::emit::wave_key()
             )
         );
         // The encoding part is this file as built.
