@@ -203,6 +203,29 @@ Merge one branch at a time. After each merge, rerun the shader tests, clippy and
 
 ## Next steps on v2
 
+0. **(2026-11-26, after the reliability work) The GPU is now the fps limit.**
+   - Run AL at 1.4 fps: 699–709 ms a frame. 243–248 ms of it is on the GPU, and about 361 ms is preparing:
+     - copies 106 ms
+     - heaps 82 ms
+     - the guard handler 65–69 ms
+     - copying back about 45 ms
+   - Sampled GPU time (`VICTORY_GPU_TIMING=1`, run `fps-P-gputiming`):
+
+     | Command | Per call |
+     |---|---|
+     | indirect `c7feccae4e01e454` | about 29 ms |
+     | indirect `8bbcbda6008eaa37` | about 24 ms |
+     | mesh `f5257487f2945fdb` | about 46 ms |
+
+     These are the runaway-loop shaders above. Their loop counts come from buffers whose producers are refused.
+   - Dropped a frame (AL):
+     - about 4,200 by the BVH builder gate;
+     - 526, 348 and 293 indirect commands of kinds 0, 1 and 2 after a dropped compute pass;
+     - 170 distinct refused compute programs, all `E_INVALIDARG`, led by `0709e8356abd9082` and `e4576c6eca0f8ce3` (143 a frame each), then `c9da71da40af2e28`, `2561af9577c47289`, `b22a16a178976e1b`, `660814153af43185` and `f8f50ab85e7b10bb` (54–62).
+   - These are wave64 programs whose cross-lane code crosses 32-lane halves (`v_mbcnt`, `v_readlane`/`v_writelane`, `ds_(b)permute`, masks read as data). `lower.rs` ported only ztrx's first part.
+   - ztrx main (`labRoot/ztrx-src`, `remotes/ztrx/main`, `emit/lower.rs` `exchange`, around lines 242–1515) has the second part: two host waves exchange through a pair of LDS dwords per console wave, with lane-uniform and own-bit analyses.
+   - Porting it is the next step. It should restore the producers, end the runaway loops and the dropped indirect commands, and let the BVH builder run.
+
 1. **Correct and isolate the shadow-trace binding.** Size `t1,space2` for every physical slot the shader may read. On this heap the extra storage is 2 MiB. Populate dynamic entries even if they predate the lazy creation of the address buffer. For dimension 11, publish the descriptor's 64-bit guest location. Clear stale entries on reuse and bounds-check the index against the metadata allocation before issuing a root load. Capture the actual rebased table, both resulting VAs and the post-clamp argument record immediately before the enabled dispatch.
 
    - Drain prior work, run the target alone and wait for its fence before submitting successors. Save DXIL, root signature/constants, descriptor types and generations, resource contents and states, page table and BVH pages at that boundary. Host GPU VAs must be rebound to replay resources. A direct `Dispatch(1,1,1)` and `ExecuteIndirect` on identical input distinguish the body from the indirect path. A zero-work control checks attribution. A known miss node isolates the remaining traversal.
