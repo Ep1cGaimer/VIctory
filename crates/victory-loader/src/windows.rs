@@ -11,7 +11,9 @@ use anyhow::{Context, Result, bail};
 use victory_pe::{ImageInfo, ImportSymbol};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
-use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualProtect};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{
@@ -196,6 +198,40 @@ impl LoadedImage {
     pub fn info(&self) -> &ImageInfo {
         &self.info
     }
+
+    /// Writes `write` at `rva + at` if the image holds `expect` at `rva`
+    /// (in memory only; the file stays as prepared). False, and nothing
+    /// written, if the bytes differ or the range is outside the image.
+    ///
+    /// # Safety
+    /// No title code runs yet, and `write` is whole instructions that keep
+    /// the code around them valid.
+    pub unsafe fn patch_code(&self, rva: usize, expect: &[u8], at: usize, write: &[u8]) -> Result<bool> {
+        let size = self.info.size_of_image as usize;
+        if rva.checked_add(expect.len().max(at + write.len())).is_none_or(|end| end > size) {
+            return Ok(false);
+        }
+        let start = self.base() + rva;
+        // SAFETY: inside the mapped image; code sections are readable.
+        let found = unsafe { std::slice::from_raw_parts(start as *const u8, expect.len()) };
+        if found != expect {
+            return Ok(false);
+        }
+        let target = start + at;
+        let mut old = 0;
+        // SAFETY: as above.
+        if unsafe { VirtualProtect(target as _, write.len(), PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+            bail!("VirtualProtect(code) failed: {}", std::io::Error::last_os_error());
+        }
+        // SAFETY: writable now; no title code runs (the caller's promise).
+        unsafe {
+            std::ptr::copy_nonoverlapping(write.as_ptr(), target as *mut u8, write.len());
+            VirtualProtect(target as _, write.len(), old, &mut old);
+            FlushInstructionCache(GetCurrentProcess(), target as _, write.len());
+        }
+        Ok(true)
+    }
+
 
     /// Address of an export of the image, if it has one by that name.
     pub fn export(&self, name: &str) -> Option<usize> {
