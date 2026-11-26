@@ -196,7 +196,7 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
-pub use lower::{host_max_wave, set_host_max_wave, set_why_label, wave_exchange, wave_key};
+pub use lower::{host_max_wave, set_host_max_wave, set_why_label, wave_exchange, wave_forms, wave_key};
 mod rect;
 pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]
@@ -458,6 +458,82 @@ pub fn emit_with(
     res: &resource::Resources,
     options: Options,
 ) -> Result<HostShader, ShaderError> {
+    let first = emit_once(c, native, p, st, io, res, options);
+    // A console wave64 compute program still in waves of 64 on a host of 32-lane waves,
+    // which the host refuses: once more in forms whose bodies are more code every lane
+    // runs, where the two host waves can exchange (fxceless/victory-fork's forms): without
+    // its early-outs, without branches that only skip code no lane is left for, and that
+    // with scalars followed through copies (`ir::without_skips`).
+    let kept = matches!(&first, Ok((_, true)));
+    if !(kept && native.stage == HwStage::Cs && native.wave64 && wave_forms()) {
+        return first.map(|(shader, _)| shader);
+    }
+    let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+    let forms: [(&str, fn(&ir::Program) -> Option<ir::Program>); 3] = [
+        ("without early-outs", ir::without_early_outs),
+        ("without skips", |p| ir::without_skips(p, false)),
+        ("without skips, scalars followed", |p| ir::without_skips(p, true)),
+    ];
+    for (name, form) in forms {
+        let Some(p) = form(p) else { continue };
+        let again = (|| {
+            let st = structure::structure(&p)?;
+            let io = io::raise(&p, native)?;
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+            emit_once(c, native, &p, &st, &io, &res, options)
+        })();
+        if why {
+            match &again {
+                Ok((_, true)) => eprintln!("wave64 form {name}: still in waves of 64"),
+                Ok(_) => eprintln!("wave64 form {name}: lowered in waves of 32"),
+                Err(e) => eprintln!("wave64 form {name}: {e}"),
+            }
+        }
+        if let Ok((shader, false)) = again {
+            return Ok(shader);
+        }
+    }
+    // Each host wave as a wave of its own, where the program's wave operations are the
+    // allocation idiom, which that keeps exact (`lower::wave_local`; fxceless/victory-fork
+    // main): the program, then its forms. `VICTORY_WAVE_LOCAL=0` turns it off.
+    if std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0") {
+        let mut bases = vec![("as it is", p.clone())];
+        bases.extend(forms.into_iter().filter_map(|(name, form)| form(p).map(|p| (name, p))));
+        for (name, p) in bases {
+            let again = (|| {
+                let st = structure::structure(&p)?;
+                if let Err((offset, what)) = lower::wave_local(&p, &st) {
+                    return Err(ShaderError::Unsupported { offset, what });
+                }
+                let io = io::raise(&p, native)?;
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+                lower::with_local_waves(|| emit_once(c, native, &p, &st, &io, &res, options))
+            })();
+            if why {
+                match &again {
+                    Ok((_, true)) => eprintln!("wave64 local waves, {name}: still in waves of 64"),
+                    Ok(_) => eprintln!("wave64 local waves, {name}: lowered in waves of 32"),
+                    Err(e) => eprintln!("wave64 local waves, {name}: {e}"),
+                }
+            }
+            if let Ok((shader, false)) = again {
+                return Ok(shader);
+            }
+        }
+    }
+    first.map(|(shader, _)| shader)
+}
+
+/// One lowering of [`emit_with`]: the shader, and whether it kept console waves of 64.
+fn emit_once(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+) -> Result<(HostShader, bool), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -542,7 +618,8 @@ pub fn emit_with(
             u.table_slots = spans.get(&u.slot).copied().flatten();
         }
     }
-    Ok(HostShader {
+    let wave64 = l.wave64;
+    Ok((HostShader {
         stage: native.stage,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -568,7 +645,7 @@ pub fn emit_with(
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
-    })
+    }, wave64))
 }
 
 /// The rows of an `ISG1`/`OSG1` part.

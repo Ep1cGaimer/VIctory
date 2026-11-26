@@ -196,3 +196,34 @@ fn the_first_lane_is_lane_0_in_both_halves() {
     ];
     check(&body, &[(0, 0)], "first-lane reads");
 }
+
+/// The title's containers saved by a run (`VICTORY_SHADER_SAVE`) in the directory
+/// `VICTORY_PROBE_DIR` names, translated as on a 32-lane host with the exchange:
+/// `VICTORY_WAVE_WHY=1 cargo test -p victory-shader saved_containers -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn saved_containers() {
+    let Some(dir) = std::env::var_os("VICTORY_PROBE_DIR") else { return };
+    lower::TEST_WAVE.set(Some((32, true)));
+    let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+    paths.sort();
+    for path in paths.iter().filter(|p| p.extension().is_some_and(|x| x == "cdxil")) {
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let bytes = std::fs::read(path).unwrap();
+        super::set_why_label(name.clone());
+        match super::translate_with(&bytes, super::Options { view_marks: true }) {
+            Ok(s) => {
+                let saved = std::fs::read(path.with_extension("dxil")).unwrap_or_default();
+                let valid = match validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                    Ok(mut v) => match v.validate(&mut s.dxil.clone()) {
+                        Ok(_) => "valid".to_string(),
+                        Err(e) => format!("INVALID: {e}"),
+                    },
+                    Err(_) => "not validated (no dxil.dll)".to_string(),
+                };
+                eprintln!("{name}: {} bytes, as the run's: {}, {valid}", s.dxil.len(), s.dxil == saved);
+            }
+            Err(e) => eprintln!("{name}: {e}"),
+        }
+    }
+}

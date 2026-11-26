@@ -1,6 +1,6 @@
 # VIctory world at 30 fps on `victory-world-30fps-v2`
 
-Last updated 2026-11-25. The v2 findings below apply to the RTX 4060 Laptop. The ss9–ss12 runs document the earlier branch.
+Last updated 2026-11-26. The v2 findings below apply to the RTX 4060 Laptop. The ss9–ss12 runs document the earlier branch.
 
 ## Goal and ground rules
 
@@ -87,6 +87,13 @@ Use the harness in `tools/lab/`: `run-probe.ps1` is the launcher and `gpumem.ps1
 
 ## What this branch did (newest first)
 
+- **2026-11-26, why the world was black: three switches, not missing shaders.**
+  - **`VICTORY_WAVE_HALVES` was off.** The runtime tells the translator the host's wave width (32 on the RTX 4060) only when `VICTORY_WAVE_HALVES=1` is set (`descriptor/host.rs`, `probe_view_heap`). It had been off since the title stalled at its account picker with it on (scripted keys get past that now). With it off, every console wave64 compute program kept `WaveSize(64)` and the driver refused it. The debug layer (`VICTORY_D3D12_DEBUG=1`, diagnostics build) says "Shader wants wave lane count of 64 but maximum wave lane count for device is 32" for every refusal in the world.
+    - That also kept `translate --cache` warms from being used: the runtime's cache key had wave width 0, the warm's 32, so every shader was translated again at runtime (`cached=false`).
+    - So gate-X (exchange on, halves off) never ran the exchange. With `VICTORY_WAVE_HALVES=1 VICTORY_WAVE_EXCHANGE=1` (run `gate-H-halves`, 15 min), refused compute programs went from 171 to 107 and drops in the world from about 760 to about 497 a frame, with no device removal. The world was still black.
+  - **The indirect-draw gate (b15112d) is global.** Any compute dispatch dropped in a frame (or the one before) drops every indirect draw and indexed draw (kinds 0 and 1), and the world's geometry is drawn that way: about 330 a frame. The 107 refusals left are mostly particles (`ptfx_*`, `GpuParticleUpdate`), which write no draw arguments, yet they kept the world dark. `VICTORY_INDIRECT_UNGATED=1` turns the gate off. The gate came from one draw with garbage arguments that ran for 24 s until the device reset; scoping it to draws whose arguments a dropped dispatch writes is the lasting fix.
+  - **Then the job pool ran dry again.** With the gate off (run `gate-U-ungated`), the world started at frame 3,034 with 14,169 draws, and 5 minutes later four job threads stopped on the pool's `int3` at `+0x1fa88e4` (`rax` low 17 bits `0x1fffe`, the empty head). 65,536 slots are not enough once the world draws.
+  - **Ported from fxceless/victory-fork main (GPL-3.0):** `ir::without_early_outs` and `ir::without_skips` (with `ir::rename` split out of `build_bounded`). With the exchange, `emit_with` retries a compute program still kept at wave64 in those forms (`wave_forms`, `VICTORY_WAVE_FORMS=0` turns it off; bit 17 of `wave_key`). On 14 saved world programs (`saved_containers`, an ignored test) they converted none. The culling programs (`InstanceCulling:CS_Prop_BatchCull`, `CS_Tree_BatchCull*`, `DistantObjects:CS_DistanceWindowEmissivesCulling`) fail on "a lane mask exchanged where not every lane runs" or "a guarded first-lane read", which is the allocation idiom victory-fork lowers per host wave (`lower::wave_local`, `with_local_waves`): the next port.
 - **caefb47** The pipeline library (1.18 GB) is serialised only when pipelines were added: once 64 are waiting, after 5 minutes, at exit, or when the prebuilt list changed. Before, it was written again every 20–30 s. The early list is written by itself.
   - In a 13-minute run, the library was written once, the lowest RAM available was 114 MB instead of 1 MB, and there was no crash.
 - **171de15 / 96e86dd / 0c590d3 (reliable past 6.5 minutes)**
