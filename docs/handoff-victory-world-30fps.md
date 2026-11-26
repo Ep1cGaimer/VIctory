@@ -1,13 +1,75 @@
 # VIctory world at 30 fps on `victory-world-30fps-v2`
 
-Last updated 2026-11-26. The v2 findings below apply to the RTX 4060 Laptop. The ss9–ss12 runs document the earlier branch.
+Last updated 2026-11-26 (evening). **Start with the next section:** the work moved to the CGBJ-based branch. The v2 findings below apply to the RTX 4060 Laptop. The ss9–ss12 runs document the earlier branch.
+
+## Start here (2026-11-26, evening): work moved to `victory-cgbj-nvidia`
+
+**The live branch is now `victory-cgbj-nvidia`** (pushed to `Ep1cGaimer/VIctory`; local worktree `C:/Vivek_projects/VIctory-cgbj`). It is the CGBJ build (codec_d's `cool_fox`, GPL-3.0, on top of avatarmanz/VIctory-7900XTX and fxceless) plus our commits. Use it rather than v2. The owner saw it draw the world with textures and lighting, which v2 never did; v2 is kept for its shader work.
+
+- **Source.** The repo `codec-d/cool_fox` was taken down. The owner supplied it as `%USERPROFILE%/Downloads/VIctory-CGBJ.zip`, SHA-256 `DD84F3BA...1AA901`, head `f4b48ad`. It is reviewed:
+  - the zip holds source only, no binaries;
+  - its build scripts only hash source;
+  - its process launches are upstream patterns (self-relaunch, `dxc`, `git` in xtask);
+  - its network shim allows loopback only;
+  - its `bcpack-tables.bin` is identical to ours.
+
+  The owner allowed it to be ported and published without restrictions (2026-11-26). An extracted copy is in `%TEMP%/victory-30fps-lab/cgbj-src`, and `cgbj/main` is fetched into this repo.
+- **Our commits on it:**
+  - `843cafa` job-slot pool fix, 131,069 slots (`fixes.rs`, plus `LoadedImage::patch_code` in the loader, which CGBJ lacked). Without it the title stops on an `int3` with `rax` low bits `0x1fffe` about 7 minutes into the world.
+  - `2fa26d9` high-performance adapter pick (`VICTORY_ADAPTER`) and a README that says NVIDIA. CGBJ made the device on DXGI's default adapter.
+- **Build:** `cargo build --release --locked -p victory -j 4` with `CARGO_TARGET_DIR=%TEMP%/victory-30fps-lab/cgbj-target`. Toolchain 1.98.1. The diag build was not tried on this base.
+- **Shaders:** `victory.exe shaders <game dir>` translates everything into the cache in about 4 minutes. The cache in use is `%TEMP%/victory-30fps-lab/cache-cgbj`.
+- **Run:**
+  - The launcher is `run <game_scarlett_master.exe> --console series-s --execute`, with the switches from CGBJ's `Play-VIctory.cmd`. They are `envC` in the lab; the friend package's `Run-VIctory.cmd` lists them.
+  - `run-probe.ps1 -Console series-s` works with the usual keys.
+  - The release build logs fps at `victory_gpu::host=info`. World captures need the diag build.
+- **Measured on this laptop** (RTX 4060 Laptop 8 GB, 15.3 GB RAM), 15-minute muted runs:
+
+  | Run | Settings | In the world | Memory | End |
+  |---|---|---|---|---|
+  | cgbj-1 | CGBJ unchanged | 0.2-2.3 fps | 19.7 GB private, 40.3/45 GB commit | job-pool `int3` at ~7 min |
+  | cgbj-B | + `VICTORY_WINDOW_KB=64`, `KEEP_SNAPSHOTS_MB=128` | 0.8 fps | free RAM 579 MB | title watchdog `+0x23cf683` (null write) during the world load, 2.5 min |
+  | **cgbj-A** | + pool fix (branch defaults) | **2.0 fps median, 2.9 best**, 4,300-5,200 draws | 20.7 GB private, ~3 GB resident, 41.6/45 GB commit, 200-600 MB RAM free | none, 15 min |
+  | cgbj-C | + `VICTORY_INPLACE=1` | 2.0 fps median | the same | none; no "in place" log lines, so stage 1 probably never applied |
+
+- **Where the frame goes (cgbj-A/C late):**
+  - The frame takes about 470 ms: about 350 ms on the GPU, about 100 ms preparing, and 50-100 ms copying back.
+  - `nvidia-smi`: GPU **100% busy at only ~30 W** (clock 2,565 MHz). The process uses 6.6 of 8 GB dedicated plus **5-6 GB of shared (system RAM) GPU memory**.
+  - So the card stalls reading over PCIe from system RAM that is itself paging. The bottleneck is memory, not shaders.
+- **CGBJ already has our memory ideas** under other names, so do not re-port our memory commits. All nine conflict with its split `host/` and residency code.
+  - `let_go_idle` (RAM-aware idle windows);
+  - `VICTORY_WINDOW_KB` (grid, default 4 MiB);
+  - `VICTORY_INPLACE` 1/2 (zero-copy, `inplace.rs`);
+  - `VICTORY_KEEP_SNAPSHOTS_MB` (256);
+  - `VICTORY_TEXTURE_BUDGET_MB`;
+  - `VICTORY_CARD_WINDOWS_MB`;
+  - `VICTORY_MEMORY_CARD_MB` (4096);
+  - `residency.rs` commit back-off.
+- **Friend test package:** `C:/VIctory-Friend` (0.84 GB) holds `victory.exe` built from `2fa26d9`, `Run-VIctory.cmd`, `Translate-Shaders.cmd` and `cache/shaders`.
+  - The target is an RTX 4080 Laptop 12 GB with 32 GB DDR5. The owner copies it plus the 208.6 GB game folder (NTFS/exFAT: 8 files are over 4 GB) to that machine.
+  - Logs go to `logs/last-run.log` there. The launcher's own smoke test was stopped at 45 s by the owner, so it is unverified.
+- **soldsawn/victory-nvidia-8gb** (allowed by exception) was also tried:
+  - release build: 0.1-0.3 fps, job-pool `int3` at ~10 min;
+  - diag build: needed two compile fixes in `watch.rs` (lab copy only); its 20-minute run was stopped by the owner before checking.
+
+  Superseded by CGBJ.
+
+**Next steps, in order:**
+1. **Read the friend-laptop log** when it comes back. Check fps in the world, private/commit, and dedicated vs shared GPU memory. This is the cleanest check that RAM is the bottleneck.
+2. **On this laptop, the memory lever is the shared GPU memory.**
+   - Find what the 5-6 GB of shared usage is: the title-memory copies in CUSTOM/L0 heaps, texture spill, or upload staging. CGBJ's memory line and the `GPU Process Memory` counters give the split.
+   - Then cap it: `VICTORY_TEXTURE_BUDGET_MB` under the 8 GB card, `VICTORY_MEMORY_CARD_MB`, and the window copies.
+   - Measure each with 15-minute muted runs, sampling `nvidia-smi` and the counters as in the lab's `gSampler`.
+3. **`VICTORY_INPLACE=1` did nothing visible.** Check with `VICTORY_INPLACE_PROBE=1` whether the driver accepts `OpenExistingHeapFromAddress1`, and whether the title's windows are private memory committed whole.
+4. **Our v2 shader work** (wave64 halves/local waves, `0fb1d8d`): only port it if CGBJ's NVIDIA wave32 lowering still refuses the programs it fixed. Compare `victory.exe shaders` refusal counts.
+5. **The diag build on this base,** for world captures to show the owner.
 
 ## Goal and ground rules
 
 - **Goal:** the title (`C:\Games\GTA6.Xbox.v1.0.2.1-CYBERLEEK`) running in the world with clean, smooth graphics at a locked 30 fps on this machine.
 - **Never write to the game folder.** Reading it is fine. The owner wants to reuse it for other ports. After runs, check that nothing changed. Fingerprint (file count, total bytes, newest write time):
   `109 224001114630 2026-11-24T09:04:57.8026955Z`.
-- **Trusted code only.** Take code only from `main` or the project's own branches of upstream VIctory (`Marvisak/VIctory`), or from popular working repos. Code merged into the main branch of a working fork is fine too (e.g. `Zettrox/ztrx`, GPL-3.0-or-later). **Never** take code from unmerged PRs; write it yourself instead (owner's clarification, 2026-11-25). XCL (`ivall/xcl`) is GPL-2.0 and VIctory is GPL-3.0: take ideas from XCL, not code.
+- **Trusted code only.** Take code only from `main` or the project's own branches of upstream VIctory (`Marvisak/VIctory`), or from popular working repos. Code merged into the main branch of a working fork is fine too (e.g. `Zettrox/ztrx`, GPL-3.0-or-later). **Never** take code from unmerged PRs; write it yourself instead (owner's clarification, 2026-11-25). XCL (`ivall/xcl`) is GPL-2.0 and VIctory is GPL-3.0: take ideas from XCL, not code. Exceptions the owner granted on 2026-11-26: `soldsawn/victory-nvidia-8gb` and CGBJ (`codec-d/cool_fox`) may be ported, and CGBJ may be published. Review code before building it, and never run another repo's shipped scripts or binaries.
 - **Remotes.** The v2 branch tracks `Ep1cGaimer/VIctory:victory-world-30fps-v2`. The upstream project is `Marvisak/VIctory`.
 - **Commits** end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
