@@ -293,11 +293,18 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Writes the early list when it changed, at most every `SAVE_EVERY` (or
+/// `now`). The library (over 1 GB here) is serialised only when pipelines
+/// were added and `now`, `SAVE_ADDED` of them are waiting, `SAVE_LATEST`
+/// has passed since it last was, or the prebuilt list changed: serialising
+/// and writing it every 20 s took a gigabyte of commit and of file cache
+/// each time, mostly for a changed early list.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static SERIALISED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    const SAVE_LATEST: std::time::Duration = std::time::Duration::from_secs(300);
+    const SAVE_ADDED: u64 = 64;
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -306,9 +313,18 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
     let (blob, prebuilt) = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        let mut serialised = SERIALISED.lock().unwrap_or_else(|e| e.into_inner());
+        let since = *serialised.get_or_insert_with(std::time::Instant::now);
+        let serialise = l.prebuilt_changed
+            || l.added > 0 && (now || l.added >= SAVE_ADDED || since.elapsed() >= SAVE_LATEST);
+        if !serialise {
+            drop((serialised, l));
+            if used_changed {
+                save_early(dir);
+            }
             return;
         }
         // SAFETY: a buffer of the size the library asks for.
@@ -320,6 +336,7 @@ pub(crate) fn save(now: bool) {
             Ok(bytes) => {
                 l.added = 0;
                 l.prebuilt_changed = false;
+                *serialised = Some(std::time::Instant::now());
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
                 let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
@@ -355,6 +372,15 @@ pub(crate) fn save(now: bool) {
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+    }
+}
+
+/// Writes the early list alone (the library unchanged on disk).
+fn save_early(dir: &std::path::Path) {
+    let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
+    match std::fs::create_dir_all(dir).and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes())) {
+        Ok(()) => tracing::debug!(early = used.len(), "early pipeline list saved"),
+        Err(e) => tracing::warn!(error = %e, "early pipeline list not saved"),
     }
 }
 
