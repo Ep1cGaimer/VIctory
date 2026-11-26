@@ -240,6 +240,12 @@ Merge one branch at a time. After each merge, rerun the shader tests, clippy and
      - overlapping the two, at most about 1.7–2 fps.
 
      30 fps (33 ms) needs both cut by more than 10x. No fork tried on this laptop has passed about 2 fps in the world. fxceless reports 7–12 fps on an RTX 4070 with 32 GB of RAM.
+   - **Heap hulls (2026-11-26).** Fixed: the submission no longer re-adds a heap's hulls it already added.
+     - Early world (runs `fps-Q-heapstat` and `fps-R-heapskip`, `labRoot/output`): each of about 64 heap steps a frame re-added a heap's whole hull list, 400,000–600,000 hulls a frame (about 9,000 a heap), so the "heaps" step took 285–321 ms. Lock waits were 0.1 ms.
+     - A heap now counts its hull rebuilds (`made`). The batch skips a heap it has added at the same count since the last title write, and the hull list is shared (`Arc`), not cloned.
+     - After the fix the heaps step took 60–117 ms (the title still changes slots between most lists: 13–29 of 24–34 asks add). Frames at 1,000–3,000 draws went from 1.5–2.0 s to 0.6–1.0 s.
+     - Diagnostics log "heap hulls per frame" at `victory_gpu::bindless=info`.
+   - **Tried and dropped: limiting what a title write invalidates** (`fps-S-narrowwrite`; patch in the session scratchpad). A title copy or memory move cleared only the copies overlapping it and its aliases (`watch` `alias_of`). The copy step stayed at 170–209 ms: it is where the queued refreshes flush. The cost is the copying itself, 200–480 MB of changed title memory a frame, not re-checking. The next lever there is shaders reading title memory without a copy (zero-copy title buffers).
 
 1. **Correct and isolate the shadow-trace binding.** Size `t1,space2` for every physical slot the shader may read. On this heap the extra storage is 2 MiB. Populate dynamic entries even if they predate the lazy creation of the address buffer. For dimension 11, publish the descriptor's 64-bit guest location. Clear stale entries on reuse and bounds-check the index against the metadata allocation before issuing a root load. Capture the actual rebased table, both resulting VAs and the post-clamp argument record immediately before the enabled dispatch.
 

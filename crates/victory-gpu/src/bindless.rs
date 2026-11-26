@@ -53,7 +53,11 @@ struct Inner {
     textures: BTreeMap<usize, u32>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), while no
     /// range is added or dropped: every list running heap shaders asks.
-    hulls: Option<Vec<Hull>>,
+    hulls: Option<Arc<Vec<Hull>>>,
+    /// Counts the times `hulls` was dropped: a submission that has added a
+    /// heap's hulls at one count need not add them again until a step
+    /// writes title memory ([`refresh`]).
+    made: u64,
     /// Per copy and kind (unordered access): the copy, and how many ranges
     /// start and end at each offset, so that the hulls are made from the
     /// copies, not from every range (the title rewrites slots between most
@@ -90,6 +94,7 @@ impl Inner {
                 // A range came or went: its copy's hull may change.
                 if (was == 0) != (now == 0) {
                     self.hulls = None;
+                    self.made += 1;
                     let ends = self
                         .ends
                         .entry((key.0, key.3))
@@ -130,21 +135,33 @@ impl Viewed {
 
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
-    fn ranges(&self) -> Vec<Hull> {
+    fn ranges(&self) -> (u64, Arc<Vec<Hull>>) {
+        #[cfg(feature = "diagnostics")]
+        let asked = std::time::Instant::now();
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(hulls) = &inner.hulls {
-            return hulls.clone();
+        #[cfg(feature = "diagnostics")]
+        {
+            ASKED[0].fetch_add(1, Relaxed);
+            ASKED[1].fetch_add(asked.elapsed().as_micros() as u64, Relaxed);
         }
-        let hulls: Vec<Hull> = inner
+        if let Some(hulls) = &inner.hulls {
+            #[cfg(feature = "diagnostics")]
+            ASKED[3].fetch_add(hulls.len() as u64, Relaxed);
+            return (inner.made, hulls.clone());
+        }
+        #[cfg(feature = "diagnostics")]
+        ASKED[2].fetch_add(1, Relaxed);
+        let hulls: Arc<Vec<Hull>> = inner
             .ends
             .iter()
             .filter_map(|(&(_, uav), (shadow, starts, ends))| {
                 let (&from, &to) = (starts.keys().next()?, ends.keys().next_back()?);
                 Some((shadow.clone(), from, to - from, uav))
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         inner.hulls = Some(hulls.clone());
-        hulls
+        (inner.made, hulls)
     }
 }
 
@@ -252,9 +269,24 @@ impl Uploads {
 /// there. Copying back the whole unordered ranges after every submission
 /// (about 1 GB of them in the world) cost seconds per frame; the upgrade
 /// is shaders marking the pages they write (as `crate::memory` does).
-pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    for (shadow, address, len, _) in viewed.ranges() {
-        add(&shadow, address as usize, len as usize);
+///
+/// `due` is asked with the heap and its hulls' count first: a heap whose
+/// hulls the submission has added since the last step writing title memory
+/// is not added again (the world's heaps hold about 9,000 hulls, asked by
+/// about 64 lists a frame: re-adding them cost 0.3 s per frame).
+pub(crate) fn refresh(
+    viewed: &Viewed,
+    due: impl FnOnce(usize, u64) -> bool,
+    mut add: impl FnMut(&Arc<Shadow>, usize, usize),
+) {
+    let (made, hulls) = viewed.ranges();
+    if !due(std::ptr::from_ref(viewed) as usize, made) {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    ASKED[6].fetch_add(1, Relaxed);
+    for (shadow, address, len, _) in hulls.iter() {
+        add(shadow, *address as usize, *len as usize);
     }
 }
 
@@ -263,6 +295,20 @@ pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, 
 static HEAP_DRAWS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 #[cfg(feature = "diagnostics")]
 static UPLOADED: AtomicU64 = AtomicU64::new(0);
+/// Heap steps asking for their hulls: asks, microseconds waiting for the
+/// heap's lock, hulls remade, hulls handed out; `forget` calls and their
+/// microseconds (diagnostics).
+#[cfg(feature = "diagnostics")]
+static ASKED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+#[cfg(feature = "diagnostics")]
+struct Forgetting(std::time::Instant);
+#[cfg(feature = "diagnostics")]
+impl Drop for Forgetting {
+    fn drop(&mut self) {
+        ASKED[4].fetch_add(1, Relaxed);
+        ASKED[5].fetch_add(self.0.elapsed().as_micros() as u64, Relaxed);
+    }
+}
 
 /// A draw or dispatch runs a shader that indexes the heap (and writes
 /// through it).
@@ -285,6 +331,8 @@ pub(crate) fn register(viewed: &Arc<Viewed>) {
 /// The title released `resource`: slots viewing it as a texture view
 /// nothing to upload any more (its memory may be gone).
 pub(crate) fn forget(resource: usize) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = Forgetting(std::time::Instant::now());
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -300,6 +348,18 @@ pub(crate) fn forget(resource: usize) {
 pub(crate) fn log(frames: f64) {
     let [draws, writes] = [0, 1].map(|i| HEAP_DRAWS[i].swap(0, Relaxed) as f64 / frames);
     let uploaded = UPLOADED.swap(0, Relaxed) as f64 / frames;
+    let asked = ASKED.each_ref().map(|a| a.swap(0, Relaxed) as f64 / frames);
+    tracing::info!(
+        "heap hulls per frame: {:.0} asks ({:.0} added), {:.1} ms waiting for heap locks, {:.0} remade, \
+         {:.0} hulls; {:.0} textures forgotten in {:.1} ms",
+        asked[0],
+        asked[6],
+        asked[1] / 1e3,
+        asked[2],
+        asked[3],
+        asked[4],
+        asked[5] / 1e3
+    );
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -314,7 +374,7 @@ pub(crate) fn log(frames: f64) {
         }
         let bytes: u64 = inner.ranges.keys().map(|&(_, a, b, _)| b - a).sum();
         drop(inner);
-        let hulls = viewed.ranges();
+        let (_, hulls) = viewed.ranges();
         let uav_hulls: u64 = hulls.iter().filter(|r| r.3).map(|r| r.2).sum();
         let all_hulls: u64 = hulls.iter().map(|r| r.2).sum();
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -491,7 +551,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 inner.slots.insert(slot, seen);
             }
         };
-        let hull = || viewed.ranges().iter().map(|h| (h.1 - at, h.2)).collect::<Vec<_>>();
+        let hull = || viewed.ranges().1.iter().map(|h| (h.1 - at, h.2)).collect::<Vec<_>>();
         set(0, Some((0x100, 0x100)));
         set(1, Some((0x800, 0x200)));
         set(2, Some((0x100, 0x100)));
