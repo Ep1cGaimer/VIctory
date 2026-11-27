@@ -137,6 +137,19 @@ pub fn run(
     };
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    if execute {
+        let pool_slots = std::env::var("VICTORY_TITLE_POOL_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(victory_game::fixes::POOL_SLOTS);
+        for patch in victory_game::fixes::patches(&hash, pool_slots) {
+            // SAFETY: the image is mapped and no title code has run.
+            let applied =
+                unsafe { image.patch_code(patch.rva, patch.expect, patch.at, &patch.write) }?;
+            anyhow::ensure!(applied, "title fix signature mismatch: {}", patch.name);
+            println!("title fix      {} ({pool_slots})", patch.name);
+        }
+    }
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
